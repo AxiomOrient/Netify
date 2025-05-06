@@ -28,7 +28,7 @@ Netify는 Swift를 위한 강력하고 유연한 네트워킹 라이브러리입
         ```swift
         // Package.swift
         dependencies: [
-            .package(url: "https://github.com/AidenJLee/Netify.git", from: "2.0.0") // TODO: 사용하려는 최신 버전을 확인하세요
+            .package(url: "https://github.com/AidenJLee/Netify.git", from: "1.0.0") // TODO: 사용하려는 최신 버전을 확인하세요
         ]
         ```
     * 해당 라이브러리가 필요한 타겟의 `dependencies`에도 `.product(name: "Netify", package: "Netify")`를 추가합니다.
