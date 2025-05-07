@@ -109,7 +109,7 @@ public enum NetworkingLogLevel: Int, Comparable, Sendable {
 
 /// HTTP 요청 메서드를 정의합니다.
 @available(iOS 15, macOS 12, *)
-public struct HTTPMethod: RawRepresentable, Equatable, Hashable {
+public struct HTTPMethod: RawRepresentable, Equatable, Hashable, Sendable {
 	public static let get = HTTPMethod(rawValue: "GET")
 	public static let post = HTTPMethod(rawValue: "POST")
 	public static let put = HTTPMethod(rawValue: "PUT")
