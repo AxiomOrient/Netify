@@ -51,7 +51,7 @@ internal enum NetifyInternalConstants {
 
 /// Netify 클라이언트의 설정을 정의하는 구조체입니다.
 @available(iOS 15, macOS 12, *)
-public struct NetifyConfiguration {
+public struct NetifyConfiguration: Sendable {
 	public let baseURL: String
 	public let sessionConfiguration: URLSessionConfiguration
 	public let defaultEncoder: JSONEncoder
@@ -62,6 +62,7 @@ public struct NetifyConfiguration {
 	public let maxRetryCount: Int
 	public let timeoutInterval: TimeInterval
 	public let authenticationProvider: AuthenticationProvider?
+	public let waitsForConnectivity: Bool // URLSessionConfiguration의 waitsForConnectivity 설정
 
 	public init(
 		baseURL: String,
@@ -73,7 +74,8 @@ public struct NetifyConfiguration {
 		cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
 		maxRetryCount: Int = 0,
 		timeoutInterval: TimeInterval = 30.0,
-		authenticationProvider: AuthenticationProvider? = nil
+		authenticationProvider: AuthenticationProvider? = nil,
+		waitsForConnectivity: Bool = false // 기본값은 false
 	) {
 		self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
 		self.sessionConfiguration = sessionConfiguration
@@ -85,12 +87,16 @@ public struct NetifyConfiguration {
 		self.maxRetryCount = max(0, maxRetryCount)
 		self.timeoutInterval = timeoutInterval
 		self.authenticationProvider = authenticationProvider
+		self.waitsForConnectivity = waitsForConnectivity
+
+		// sessionConfiguration에 waitsForConnectivity 적용
+		self.sessionConfiguration.waitsForConnectivity = waitsForConnectivity
 	}
 }
 
 /// 네트워크 로깅의 상세 수준을 정의합니다.
 @available(iOS 15, macOS 12, *)
-public enum NetworkingLogLevel: Int, Comparable {
+public enum NetworkingLogLevel: Int, Comparable, Sendable {
 	case off = 0
 	case error = 1
 	case info = 2
@@ -153,7 +159,7 @@ public typealias HTTPHeaders = [String: String]
 
 /// 사용자 자격 증명 (기본 인증용)
 @available(iOS 15, macOS 12, *)
-public struct UserCredentials {
+public struct UserCredentials: Sendable {
 	let username: String
 	let password: String
 
@@ -435,17 +441,24 @@ public enum NetworkRequestError: LocalizedError, Equatable {
 		case (.clientError(let lc, _), .clientError(let rc, _)): return lc == rc
 		case (.serverError(let lc, _), .serverError(let rc, _)): return lc == rc
 		// For errors with underlying errors, comparing types might be enough, or compare underlying NSError domain/code
-		case (.decodingError(let le, _), .decodingError(let re, _)):
-			return (le as NSError).domain == (re as NSError).domain
-				&& (le as NSError).code == (re as NSError).code
-		case (.encodingError(let le), .encodingError(let re)):
-			return (le as NSError).domain == (re as NSError).domain
-				&& (le as NSError).code == (re as NSError).code
-		case (.urlSessionFailed(let le), .urlSessionFailed(let re)):
-			return (le as NSError).domain == (re as NSError).domain
-				&& (le as NSError).code == (re as NSError).code
+		// For non-optional underlying errors, 'as NSError' is safe due to Swift's bridging if the compiler warning
+		// "Conditional cast from 'any Error' to 'NSError' always succeeds" is heeded.
+		case (.decodingError(let lhsError, _), .decodingError(let rhsError, _)):
+			let lns = lhsError as NSError
+			let rns = rhsError as NSError
+			return lns.domain == rns.domain && lns.code == rns.code
+		case (.encodingError(let lhsError), .encodingError(let rhsError)):
+			let lns = lhsError as NSError
+			let rns = rhsError as NSError
+			return lns.domain == rns.domain && lns.code == rns.code
+		case (.urlSessionFailed(let lhsError), .urlSessionFailed(let rhsError)):
+			let lns = lhsError as NSError
+			let rns = rhsError as NSError
+			return lns.domain == rns.domain && lns.code == rns.code
 		case (.unknownError(let le), .unknownError(let re)):
-			// Comparing underlying errors can be complex, checking type might suffice for some cases
+			// For optional underlying errors, 'as? NSError' correctly handles nil.
+			// The warning on this line is about the cast itself if 'le' or 're' are non-nil,
+			// but the if-let structure is sound for handling optionality.
 			if le == nil && re == nil { return true }
 			if let lerr = le as NSError?, let rerr = re as NSError? {
 				return lerr.domain == rerr.domain && lerr.code == rerr.code
@@ -500,7 +513,7 @@ extension NetifyRequest {
 
 /// 인증 관련 동작을 정의하는 프로토콜입니다.
 @available(iOS 15, macOS 12, *)
-public protocol AuthenticationProvider {
+public protocol AuthenticationProvider: Sendable {
 	/// 요청에 인증 정보를 비동기적으로 추가합니다.
 	/// - Throws: 인증 정보 추가 중 발생할 수 있는 오류 (예: 자격 증명 로드 실패).
 	func authenticate(request: URLRequest) async throws -> URLRequest
@@ -516,7 +529,7 @@ public protocol AuthenticationProvider {
 
 /// HTTP 기본 인증 프로바이더입니다.
 @available(iOS 15, macOS 12, *)
-public struct BasicAuthenticationProvider: AuthenticationProvider {
+public struct BasicAuthenticationProvider: AuthenticationProvider, Sendable {
 	private let credentials: UserCredentials
 
 	public init(credentials: UserCredentials) {
@@ -553,10 +566,10 @@ public actor BearerTokenAuthenticationProvider: AuthenticationProvider {
 	/// - Parameter refreshToken: 현재 리프레시 토큰.
 	/// - Returns: 새로 발급받은 토큰 정보 (`TokenInfo`).
 	/// - Throws: 토큰 갱신 중 발생한 오류.
-	public typealias RefreshTokenHandler = (String) async throws -> TokenInfo
+	public typealias RefreshTokenHandler = @Sendable (String) async throws -> TokenInfo
 
 	/// 갱신된 토큰 정보를 담는 구조체.
-	public struct TokenInfo: Codable {
+	public struct TokenInfo: Codable, Sendable {
 		public let accessToken: String
 		public let refreshToken: String?
 		public let expiresIn: TimeInterval?  // Optional expiration time (seconds)

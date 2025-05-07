@@ -21,6 +21,12 @@ struct Post: Codable {
     let body: String
     let userId: Int
 }
+// jsonplaceholder.typicode.com/posts 에 POST 요청 시 실제 응답 모델
+struct CreatedPostResponse: Codable {
+    let id: Int
+    // title, body, userId는 실제 응답에 포함되지 않음
+}
+
 
 struct Comment: Codable {
     let postId: Int
@@ -79,19 +85,20 @@ extension Post {
 
     struct CreateRequest: NetifyRequest {  // DecRequest -> NetifyRequest
         typealias ReturnType = Post
+        // 참고: jsonplaceholder.typicode.com/posts 에 POST 요청 시 실제 응답은 {"id": 101} 형태입니다.
+        // 이 ReturnType (Post)으로 디코딩 시도 시, title, body, userId 필드가 없어 디코딩 오류가 발생합니다.
+        // 이는 jsonplaceholder의 특성이며, 일반적인 API는 생성된 전체 객체를 반환하는 경우가 많습니다.
 
         let path = "/posts" // 요청 경로
         let method: HTTPMethod = .post
-        // NetifyRequest의 body는 Any? 타입이므로, Encodable 객체나 Dictionary를 직접 할당합니다.
-        // JSON으로 보내려면 Dictionary<String, Any> 또는 아래 Encodable 예제처럼 구조체를 사용합니다.
-        let body: [String: Any]?  // Netify의 body 타입에 맞게 수정 (Any? 또는 Encodable)
+        let body: CreatePostBody // Encodable 객체를 직접 사용 권장
 
         init(title: String, body: String, userId: Int) {
-            self.body = [
-                "title": title,
-                "body": body,
-                "userId": userId,
-            ]
+            self.body = CreatePostBody(
+                title: title,
+                body: body,
+                userId: userId
+            )
         }
     }
 
@@ -104,10 +111,10 @@ extension Post {
 
     // Encodable 객체를 본문으로 사용하는 POST 요청
     struct CreateWithEncodableRequest: NetifyRequest {
-        typealias ReturnType = Post // 생성된 Post 객체를 기대
+        typealias ReturnType = Post // 생성된 Post 객체를 기대 (위 CreateRequest와 동일한 jsonplaceholder 응답 특성 참고)
         let path = "/posts"
         let method: HTTPMethod = .post
-        let body: Encodable? // body 타입을 Encodable? 로 명시 (CreatePostBody 인스턴스 할당)
+        let body: CreatePostBody // body 타입을 구체적인 Encodable 타입으로 명시
 
         init(postData: CreatePostBody) { self.body = postData }
     }
@@ -118,16 +125,18 @@ extension Post {
 
         let path: String  // 경로에 업데이트할 게시글 ID 포함 (예: /posts/1)
         let method: HTTPMethod = .put
-        let body: [String: Any]?  // 업데이트할 내용
+        let body: CreatePostBody // 업데이트할 내용 (CreatePostBody 재활용 또는 UpdatePostBody 정의)
 
         init(postId: Int, title: String, body: String, userId: Int) {
             self.path = "/posts/\(postId)"
-            self.body = [
-                "id": postId,  // API에 따라 ID를 본문에 포함할 수 있음
-                "title": title,
-                "body": body,
-                "userId": userId,
-            ]
+            // jsonplaceholder PUT 요청 시 id는 경로로 전달, 본문에는 id 제외 가능
+            self.body = CreatePostBody(
+                title: title,
+                body: body,
+                userId: userId
+            )
+            // 만약 API가 본문에 id를 요구한다면, CreatePostBody에 id를 추가하거나
+            // 별도의 UpdatePostBody 모델을 만들어야 합니다.
         }
     }
 
@@ -191,10 +200,10 @@ struct GetRawDataRequest: NetifyRequest {
     let method: HTTPMethod = .get
     var requiresAuthentication: Bool = false // 예시: 인증 불필요
 
-    init(imagePath: String) {
+    init(path: String) {
         // 중요: 실제 API 경로로 변경해야 함
         // jsonplaceholder는 이미지 경로를 제공하지 않으므로, 다른 더미 API나 실제 API 사용 필요
-        self.path = imagePath // 예: "/images/logo.png"
+        self.path = path // 예: "/200/300" for picsum.photos
     }
 }
 
@@ -246,7 +255,8 @@ func fetchData() async {
     // 1. 기본 Netify 클라이언트 설정 생성
     let configuration = NetifyConfiguration(
         baseURL: "https://jsonplaceholder.typicode.com",
-        logLevel: .debug  // 개발 중에는 debug 레벨로 설정하여 상세 로그 확인
+        logLevel: .debug,  // 개발 중에는 debug 레벨로 설정하여 상세 로그 확인
+        waitsForConnectivity: false
             // 필요시 다른 설정 추가 (타임아웃, 기본 헤더 등)
     )
     // 2. 기본 Netify 클라이언트 인스턴스 생성
@@ -288,30 +298,26 @@ func fetchData() async {
             print("   - 사용자 ID \(user.id)는 작성한 게시글이 없습니다.")
         }
 
-        // 6. 새 게시글 생성하기 (Dictionary 사용)
+        // 6. 새 게시글 생성하기 (Encodable 객체 사용 - 권장)
         // --- POST Post ---
-        print("\n[POST] 새 게시글 생성 중 (Dictionary 사용)...")
-        let newPost = try await netifyClient.send(
-            Post.CreateRequest(title: "New Post", body: "This is a new post", userId: user.id)
-        )
-        // jsonplaceholder는 생성 시 ID를 101로 반환하는 경향이 있음
-        print("✅ 새 게시글 생성됨: \(newPost.title) (ID: \(newPost.id))")
-
-        // 7. 새 게시글 생성하기 (Encodable 객체 사용)
-        // --- POST Post with Encodable ---
         print("\n[POST] 새 게시글 생성 중 (Encodable 객체 사용)...")
         let postData = Post.CreatePostBody(title: "Encodable Post", body: "Using Encodable struct", userId: user.id)
+
+        // NetifyRequest의 ReturnType이 Post이므로, jsonplaceholder의 응답({"id": 101})을
+        // Post로 디코딩하려 할 때 title, body, userId 필드가 없어 디코딩 오류가 발생합니다.
+        // 이는 jsonplaceholder의 특성이며, Netify의 오류 처리 방식을 보여줍니다.
+        // 실제 API는 보통 생성된 전체 객체를 반환합니다.
         let createdPostEncodable = try await netifyClient.send(Post.CreateWithEncodableRequest(postData: postData))
         print("✅ Encodable 본문으로 게시글 생성됨: \(createdPostEncodable.title) (ID: \(createdPostEncodable.id))")
 
-        print("✅ 새 게시글 생성됨: \(newPost.title) (ID: \(newPost.id))")
-
         // 7. 생성된 게시글 업데이트하기
         // --- PUT Post ---
-        print("\n[PUT] 게시글 ID \(newPost.id) 업데이트 중...")
+        // 위 POST 요청이 성공했다고 가정하고 (실제로는 jsonplaceholder에서 디코딩 오류 발생)
+        // ID를 사용하여 업데이트를 시도합니다. 실제 사용 시에는 POST 응답의 ID를 사용해야 합니다.
+        print("\n[PUT] 게시글 ID \(createdPostEncodable.id) 업데이트 중...")
         let updatedPost = try await netifyClient.send(
             Post.UpdateRequest(
-                postId: newPost.id, title: "Updated Title", body: "Content updated.",
+                postId: createdPostEncodable.id, title: "Updated Title", body: "Content updated.",
                 userId: user.id)
         )
         print("✅ 게시글 업데이트됨: \(updatedPost.title) (ID: \(updatedPost.id))")
@@ -319,7 +325,7 @@ func fetchData() async {
 
         // 8. 게시글 삭제하기
         // --- DELETE Post ---
-        print("\n[DELETE] 게시글 ID \(updatedPost.id) 삭제 중...")
+        print("\n[DELETE] 게시글 ID \(updatedPost.id) 삭제 중...") // updatedPost.id 사용
         // DeleteRequest의 ReturnType이 EmptyResponse이므로 반환값은 사용하지 않음
         _ = try await netifyClient.send(Post.DeleteRequest(postId: updatedPost.id))
         print("✅ 게시글 ID \(updatedPost.id) 삭제됨.")
@@ -355,7 +361,8 @@ func fetchAdvancedData() async {
     let authConfig = NetifyConfiguration(
         baseURL: "https://jsonplaceholder.typicode.com", // 실제 인증 API URL로 변경 필요
         logLevel: .debug,
-        authenticationProvider: dummyTokenProvider
+        authenticationProvider: dummyTokenProvider,
+        waitsForConnectivity: false
     )
     let authClient = NetifyClient(configuration: authConfig)
 
@@ -372,7 +379,10 @@ func fetchAdvancedData() async {
     }
 
     // --- Example: Custom Decoder ---
-    let basicClient = NetifyClient(configuration: .init(baseURL: "https://jsonplaceholder.typicode.com", logLevel: .info))
+    let basicClientConfig = NetifyConfiguration(
+        baseURL: "https://jsonplaceholder.typicode.com",
+        logLevel: .info)
+    let basicClient = NetifyClient(configuration: basicClientConfig)
     print("\n[GET with Custom Decoder] 커스텀 디코더 사용 요청 (Post ID: 1)...")
     do {
         // 실제 jsonplaceholder 응답에는 'publishedAt' 필드가 없으므로 디코딩 에러 발생 예상
@@ -385,12 +395,12 @@ func fetchAdvancedData() async {
 
     // --- Example: Fetching Raw Data ---
     // 중요: jsonplaceholder는 이미지 URL을 제공하지 않습니다.
-    // 다른 이미지 제공 API URL (예: https://picsum.photos) 또는 실제 URL로 변경해야 합니다.
-    let imageClientConfig = NetifyConfiguration(baseURL: "https://via.placeholder.com", logLevel: .info) // 예시 이미지 URL
+    // picsum.photos를 사용하여 임의의 이미지를 가져옵니다.
+    let imageClientConfig = NetifyConfiguration(baseURL: "https://picsum.photos", logLevel: .info, waitsForConnectivity: false)
     let imageClient = NetifyClient(configuration: imageClientConfig)
     print("\n[GET Raw Data] 원시 데이터(이미지) 요청...")
     do {
-        let imageData = try await imageClient.send(GetRawDataRequest(imagePath: "/150")) // 예시 경로
+        let imageData = try await imageClient.send(GetRawDataRequest(path: "/200/300")) // 예: 200x300 크기 이미지
         print("✅ Raw data fetched: \(imageData.count) bytes")
         // 실제 앱에서는 이 데이터를 UIImage 등으로 변환하여 사용
     } catch {
@@ -410,7 +420,11 @@ func fetchAdvancedData() async {
     }
 
     // --- Example: Custom Timeout ---
-    let timeoutClientConfig = NetifyConfiguration(baseURL: "https://jsonplaceholder.typicode.com", logLevel: .debug, timeoutInterval: 30.0) // 기본 30초
+    let timeoutClientConfig = NetifyConfiguration(
+        baseURL: "https://jsonplaceholder.typicode.com",
+        logLevel: .debug,
+        timeoutInterval: 30.0 // NetifyClient의 기본 타임아웃
+    )
     let timeoutClient = NetifyClient(configuration: timeoutClientConfig)
     print("\n[GET with Custom Timeout] 사용자 ID 1 정보 가져오는 중 (5초 타임아웃)...")
     do {
@@ -430,7 +444,8 @@ func fetchAdvancedData() async {
     let retryClientConfig = NetifyConfiguration(
         baseURL: "https://httpbin.org", // 5xx 오류 테스트 가능한 API 사용 (예시)
         logLevel: .debug,
-        maxRetryCount: 3 // 재시도 3회 설정
+        maxRetryCount: 3, // 재시도 3회 설정
+        waitsForConnectivity: false // 재시도 클라이언트에도 적용
     )
     let retryClient = NetifyClient(configuration: retryClientConfig)
     print("\n[GET with Retry] 503 오류를 유발하여 재시도 테스트 중...")
@@ -447,7 +462,10 @@ func fetchAdvancedData() async {
 
     // --- Example: Request Cancellation ---
     print("\n[GET with Cancellation] 사용자 정보 요청 시작 후 즉시 취소 시도...")
-    let cancelClient = NetifyClient(configuration: .init(baseURL: "https://jsonplaceholder.typicode.com", logLevel: .debug))
+    let cancelClientConfig = NetifyConfiguration(
+        baseURL: "https://jsonplaceholder.typicode.com",
+        logLevel: .debug)
+    let cancelClient = NetifyClient(configuration: cancelClientConfig)
     // Task 생성
     let task = Task {
         do {
