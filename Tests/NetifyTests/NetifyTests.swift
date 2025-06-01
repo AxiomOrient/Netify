@@ -1,519 +1,517 @@
 import XCTest
-
-// TODO: 'Netify'를 실제 프로젝트의 모듈 이름으로 변경하세요.
-// 예: @testable import MyApp 또는 @testable import MyNetifyLibrary
-@testable import Netify // 실제 프로젝트 모듈 이름
+@testable import Netify // 실제 프로젝트 모듈 이름으로 변경하세요.
 
 // MARK: - Main Test Class
-@available(iOS 15, macOS 12, *) // async/await 사용 위해 클래스 레벨에 적용
+@available(iOS 15, macOS 12, *)
 final class NetifyTests: XCTestCase {
-
-    // MARK: Properties for Mock Tests
+    
+    // MARK: Properties
     var mockNetworkSession: MockNetworkSession!
     var mockNetifyClient: NetifyClient!
     let mockBaseURL = "https://mock.api.example.com"
-
-    // MARK: Properties for Integration Tests
+    
     var integrationNetifyClient: NetifyClient!
     let integrationBaseURL = "https://jsonplaceholder.typicode.com"
-
+    
     // MARK: Test Lifecycle
     override func setUpWithError() throws {
         try super.setUpWithError()
-
+        
         // Mock Test Setup
         mockNetworkSession = MockNetworkSession()
-        // Use a consistent encoder/decoder setup for mock client
         let sharedEncoder = JSONEncoder()
         sharedEncoder.dateEncodingStrategy = .iso8601
-        // Ensure other relevant encoder settings are mirrored if necessary (e.g., outputFormatting for body comparison)
+        sharedEncoder.outputFormatting = .sortedKeys // 요청 본문 비교 일관성 확보
+        
         let sharedDecoder = JSONDecoder()
         sharedDecoder.dateDecodingStrategy = .iso8601
+        
         let mockConfig = NetifyConfiguration(
             baseURL: mockBaseURL,
-            sessionConfiguration: .ephemeral,
-            defaultEncoder: sharedEncoder, // Use the shared encoder
-            defaultDecoder: sharedDecoder, // 설정된 디코더 사용
-            logLevel: .debug // 문제 확인을 위해 debug로 변경 (필요시 .off)
+            sessionConfiguration: .ephemeral, // 테스트 시 네트워크 캐시 등 방지
+            defaultEncoder: sharedEncoder,
+            defaultDecoder: sharedDecoder,
+            logLevel: .debug // 테스트 중 상세 로그 확인 (필요시 .off 또는 .error로 변경)
         )
-        // 수정된 NetifyClient init 사용 (NetworkSessionProtocol 주입)
         mockNetifyClient = NetifyClient(configuration: mockConfig, networkSession: mockNetworkSession)
-
+        
         // Integration Test Setup
         integrationNetifyClient = makeRealNetifyClient()
     }
-
+    
     override func tearDownWithError() throws {
-        mockNetifyClient = nil
         mockNetworkSession = nil
+        mockNetifyClient = nil
         integrationNetifyClient = nil
         try super.tearDownWithError()
     }
-
-    // MARK: - Mock Based Unit Tests
-
-    // !!! 모든 테스트 함수 시그니처에 throws 추가 !!!
+    
+    // MARK: - Mock Based Unit Tests (NetifyRequest Protocol Based)
+    
     /**
-     * @Intent: `NetifyClient`가 `MockNetworkSession`을 통해 성공적인 GET 요청을 처리하고, 응답 데이터를 올바르게 디코딩하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 예상되는 `MockUser` 데이터와 200 OK 응답이 설정되어 있습니다. `GetMockUserRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 `GetMockUserRequest`를 전송합니다.
-     * @Then: 반환된 `MockUser` 객체가 예상된 값과 일치하고, `MockNetworkSession`에 전달된 요청의 URL과 HTTP 메서드가 올바른지 단언합니다.
+     * @Intent: 프로토콜 기반 GET 요청이 성공적으로 처리되고 응답이 디코딩되는지 검증합니다.
+     * @Given: `MockUser` 데이터와 200 OK 응답이 `MockNetworkSession`에 설정됩니다. `GetMockUserRequest`가 준비됩니다.
+     * @When: `mockNetifyClient.send()`로 요청을 전송합니다.
+     * @Then: 반환된 `MockUser`가 예상과 같고, 요청 URL과 메소드가 올바른지 확인합니다.
      */
-    func testMock_SuccessfulGETRequest() async throws {
+    func testMock_SuccessfulGETRequest_ProtocolBased() async throws {
         // Given
         let expectedUser = MockUser(id: 1, name: "John Doe")
         let mockData = try JSONEncoder().encode(expectedUser)
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/users/1"))
         let mockResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-
+        
         mockNetworkSession.mockData = mockData
         mockNetworkSession.mockResponse = mockResponse
-
+        
         let request = GetMockUserRequest(userId: 1)
-
+        
         // When
         let user: MockUser = try await mockNetifyClient.send(request)
-
+        
         // Then
         XCTAssertEqual(user, expectedUser)
         XCTAssertEqual(mockNetworkSession.lastRequest?.url?.absoluteString, "\(mockBaseURL)/users/1")
         XCTAssertEqual(mockNetworkSession.lastRequest?.httpMethod, "GET")
     }
-
+    
     /**
-     * @Intent: `NetifyClient`가 `MockNetworkSession`을 통해 성공적인 POST 요청을 처리하고, 요청 본문을 올바르게 인코딩하며, 응답 데이터를 디코딩하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 예상되는 `MockUserResponse` 데이터와 201 Created 응답이 설정되어 있습니다. `CreateMockUserRequest`와 입력 페이로드가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 `CreateMockUserRequest`를 전송합니다.
-     * @Then: 반환된 `MockUserResponse` 객체의 속성들이 예상된 값과 일치하고, `MockNetworkSession`에 전달된 요청의 URL, HTTP 메서드, HTTP 바디, Content-Type 헤더가 올바른지 단언합니다.
+     * @Intent: 프로토콜 기반 POST 요청의 본문 인코딩 및 응답 디코딩을 검증합니다.
+     * @Given: `MockUserResponse` 데이터와 201 Created 응답이 `MockNetworkSession`에 설정됩니다. `CreateMockUserRequest`가 준비됩니다.
+     * @When: `mockNetifyClient.send()`로 요청을 전송합니다.
+     * @Then: 반환된 응답이 예상과 같고, 요청 URL, 메소드, 본문, Content-Type이 올바른지 확인합니다.
      */
-    func testMock_SuccessfulPOSTRequest() async throws {
+    func testMock_SuccessfulPOSTRequest_ProtocolBased() async throws {
         // Given
         let inputUserPayload = MockUserInput(name: "Jane Doe", job: "Developer")
-        // Use an encoder consistent with the mockNetifyClient's configuration for creating mock data
-        let testEncoder = JSONEncoder()
-        testEncoder.dateEncodingStrategy = .iso8601 // NetifyClient의 디코더와 일치
-
-        // createdAt은 서버 응답처럼 처리하기 위해 테스트 시점의 Date 사용
-        // 실제 응답은 문자열로 오므로, 비교를 위해 Date를 문자열로 변환 후 다시 Date로 파싱하거나, TimeInterval로 비교
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = .sortedKeys
+        
         let now = Date()
         let expectedResponseUser = MockUserResponse(id: "123", name: "Jane Doe", job: "Developer", createdAt: now)
+        let mockResponseData = try encoder.encode(expectedResponseUser)
         
-        // Mock 응답 데이터 생성 시에도 동일한 인코딩 전략 사용
-        let mockRequestData = try testEncoder.encode(inputUserPayload)
-        let mockResponseData = try testEncoder.encode(expectedResponseUser) // 이제 createdAt이 ISO8601 문자열로 인코딩됨
-
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/users"))
         let mockResponse = HTTPURLResponse(url: url, statusCode: 201, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-
+        
         mockNetworkSession.mockData = mockResponseData
         mockNetworkSession.mockResponse = mockResponse
-
+        
         let request = CreateMockUserRequest(userInput: inputUserPayload)
-
+        
         // When
         let createdUserResponse: MockUserResponse = try await mockNetifyClient.send(request)
-
+        
         // Then
         XCTAssertEqual(createdUserResponse.name, expectedResponseUser.name)
         XCTAssertEqual(createdUserResponse.job, expectedResponseUser.job)
         XCTAssertNotNil(createdUserResponse.id)
-        // Date 비교 시 TimeIntervalSince1970 사용, ISO8601은 초 단위까지는 보통 정확하므로 accuracy를 1.0 (1초) 정도로 설정
-        // 또는 더 정밀하게 하려면 인코딩/디코딩 과정을 정확히 이해하고 그에 맞는 accuracy 설정
         XCTAssertEqual(createdUserResponse.createdAt.timeIntervalSince1970, expectedResponseUser.createdAt.timeIntervalSince1970, accuracy: 1.0)
-
+        
         XCTAssertEqual(mockNetworkSession.lastRequest?.url?.absoluteString, "\(mockBaseURL)/users")
         XCTAssertEqual(mockNetworkSession.lastRequest?.httpMethod, "POST")
-        XCTAssertEqual(mockNetworkSession.lastRequest?.httpBody, mockRequestData)
-        XCTAssertEqual(mockNetworkSession.lastRequest?.value(forHTTPHeaderField: "Content-Type"), "application/json; charset=utf-8")
+        
+        guard let actualBodyData = mockNetworkSession.lastRequest?.httpBody else {
+            XCTFail("Actual request body data is nil"); return
+        }
+        let actualInputPayload = try mockNetifyClient.configuration.defaultDecoder.decode(MockUserInput.self, from: actualBodyData)
+        XCTAssertEqual(actualInputPayload, inputUserPayload, "Decoded request body mismatch")
+        
+        XCTAssertEqual(mockNetworkSession.lastRequest?.value(forHTTPHeaderField: "Content-Type"), HTTPContentType.json.rawValue)
     }
+    
+    // MARK: - Mock Based Error Handling Tests (Protocol Based)
 
-    /**
-     * @Intent: `NetifyClient`가 HTTP 404 Not Found 응답을 `NetworkRequestError.notFound`로 올바르게 매핑하고, 오류 응답 데이터를 포함하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 404 응답과 오류 JSON 데이터가 설정되어 있습니다. 존재하지 않는 아이템을 요청하는 `GetMockItemRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.notFound` 오류가 발생하고, 해당 오류에 포함된 데이터가 `MockNetworkSession`에 설정된 오류 데이터와 일치하는지 단언합니다.
-     */
-    func testMock_ClientError_404_NotFound() async throws { // throws 추가
+    func testMock_ClientError_404_NotFound() async throws {
         // Given
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/items/999"))
-        let mockResponse = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        let errorData = #"{"error": "Item not found", "code": "ITEM_NOT_FOUND"}"#.data(using: .utf8)
-
-        mockNetworkSession.mockResponse = mockResponse
-        mockNetworkSession.mockData = errorData
-
+        let mockErrorResponse = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        let errorJSONData = #"{"error": "Item not found"}"#.data(using: .utf8)
+        mockNetworkSession.mockResponse = mockErrorResponse
+        mockNetworkSession.mockData = errorJSONData
         let request = GetMockItemRequest(itemId: 999)
 
         // When/Then
         do {
             _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.notFound but got success")
+            XCTFail("Expected NetworkRequestError.notFound")
         } catch let error as NetworkRequestError {
-            // Then
-            if case .notFound(let data) = error {
-                XCTAssertEqual(data, errorData, "Error data mismatch")
-            } else {
-                XCTFail("Expected .notFound error but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
+            if case .notFound(let data) = error { XCTAssertEqual(data, errorJSONData) } else { XCTFail("Expected .notFound, got \(error)") }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
     }
 
-    /**
-     * @Intent: `NetifyClient`가 HTTP 400 Bad Request 응답을 `NetworkRequestError.badRequest`로 올바르게 매핑하고, 오류 응답 데이터를 포함하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 400 응답과 오류 JSON 데이터가 설정되어 있습니다. 유효하지 않은 사용자 입력을 포함하는 `CreateMockUserRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.badRequest` 오류가 발생하고, 해당 오류에 포함된 데이터가 `MockNetworkSession`에 설정된 오류 데이터와 일치하는지 단언합니다.
-     */
-    func testMock_ClientError_400_BadRequest() async throws { // throws 추가
+    func testMock_ClientError_400_BadRequest() async throws {
         // Given
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/users"))
-        let mockResponse = HTTPURLResponse(url: url, statusCode: 400, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        let errorData = #"{"error": "Invalid input: Name is required", "field": "name"}"#.data(using: .utf8)
-
-        mockNetworkSession.mockResponse = mockResponse
-        mockNetworkSession.mockData = errorData
-
-        let invalidUserInput = MockUserInput(name: "", job: "Tester")
-        let request = CreateMockUserRequest(userInput: invalidUserInput)
+        let mockErrorResponse = HTTPURLResponse(url: url, statusCode: 400, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        let errorJSONData = #"{"error": "Invalid input"}"#.data(using: .utf8)
+        mockNetworkSession.mockResponse = mockErrorResponse
+        mockNetworkSession.mockData = errorJSONData
+        let request = CreateMockUserRequest(userInput: MockUserInput(name: "", job: "Test"))
 
         // When/Then
         do {
             _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.badRequest but got success")
+            XCTFail("Expected NetworkRequestError.badRequest")
         } catch let error as NetworkRequestError {
-            // Then
-            if case .badRequest(let data) = error {
-                XCTAssertEqual(data, errorData)
-            } else {
-                XCTFail("Expected .badRequest error but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
+            if case .badRequest(let data) = error { XCTAssertEqual(data, errorJSONData) } else { XCTFail("Expected .badRequest, got \(error)") }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
     }
-
-    /**
-     * @Intent: `NetifyClient`가 HTTP 500 Internal Server Error 응답을 `NetworkRequestError.serverError`로 올바르게 매핑하고, 상태 코드와 오류 응답 데이터를 포함하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 500 응답과 오류 JSON 데이터가 설정되어 있습니다. 서버 오류를 시뮬레이션하는 `GetMockStatusRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.serverError` 오류가 발생하고, 해당 오류에 포함된 상태 코드가 500이고 데이터가 `MockNetworkSession`에 설정된 오류 데이터와 일치하는지 단언합니다.
-     */
-    func testMock_ServerError_500() async throws { // throws 추가
+    
+    func testMock_ServerError_500() async throws {
         // Given
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/status/500"))
-        let mockResponse = HTTPURLResponse(url: url, statusCode: 500, httpVersion: "HTTP/1.1", headerFields: nil)!
-        let errorData = #"{"error": "Something went wrong on the server"}"#.data(using: .utf8)
-
-        mockNetworkSession.mockResponse = mockResponse
-        mockNetworkSession.mockData = errorData
-
+        let mockErrorResponse = HTTPURLResponse(url: url, statusCode: 500, httpVersion: "HTTP/1.1", headerFields: nil)!
+        let errorJSONData = #"{"error": "Server issue"}"#.data(using: .utf8)
+        mockNetworkSession.mockResponse = mockErrorResponse
+        mockNetworkSession.mockData = errorJSONData
         let request = GetMockStatusRequest(code: 500)
 
         // When/Then
         do {
             _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.serverError but got success")
+            XCTFail("Expected NetworkRequestError.serverError")
         } catch let error as NetworkRequestError {
-            // Then
             if case .serverError(let statusCode, let data) = error {
                 XCTAssertEqual(statusCode, 500)
-                XCTAssertEqual(data, errorData)
-            } else {
-                XCTFail("Expected .serverError(statusCode: 500, ...) but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
+                XCTAssertEqual(data, errorJSONData)
+            } else { XCTFail("Expected .serverError, got \(error)") }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
     }
 
-    /**
-     * @Intent: `NetifyClient`가 잘못된 형식의 JSON 응답을 수신했을 때 `NetworkRequestError.decodingError`를 올바르게 발생시키고, 원본 디코딩 오류와 데이터를 포함하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 200 OK 응답과 디코딩할 수 없는 잘못된 형식의 JSON 데이터가 설정되어 있습니다. `MockUser`를 기대하는 `GetMockUserRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.decodingError` 오류가 발생하고, 내재된 오류가 `DecodingError` 타입이며 연관된 데이터가 원본의 잘못된 데이터와 일치하는지 단언합니다.
-     */
-    func testMock_DecodingError() async throws { // throws 추가
+    func testMock_DecodingError() async throws {
         // Given
-        let malformedData = #"{"message": "Operation successful", "unexpected_field": true}"#.data(using: .utf8)!
+        let malformedJSONData = #"{"id":1,"name":"Test" corrupted}"#.data(using: .utf8)! // Corrupted JSON
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/users/1"))
-        let mockResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-
-        mockNetworkSession.mockData = malformedData
-        mockNetworkSession.mockResponse = mockResponse
-
-        let request = GetMockUserRequest(userId: 1) // MockUser를 기대
+        let mockOKResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        mockNetworkSession.mockData = malformedJSONData
+        mockNetworkSession.mockResponse = mockOKResponse
+        let request = GetMockUserRequest(userId: 1)
 
         // When/Then
         do {
             _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.decodingError but got success")
+            XCTFail("Expected NetworkRequestError.decodingError")
         } catch let error as NetworkRequestError {
-            // Then
             if case .decodingError(let underlyingError, let data) = error {
-                XCTAssert(underlyingError is DecodingError, "Underlying error should be DecodingError, but was \(type(of: underlyingError))")
-                XCTAssertEqual(data, malformedData, "Associated data should be the malformed data")
-            } else {
-                XCTFail("Expected .decodingError but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
+                XCTAssert(underlyingError is Swift.DecodingError)
+                XCTAssertEqual(data, malformedJSONData)
+            } else { XCTFail("Expected .decodingError, got \(error)") }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
     }
 
-    /**
-     * @Intent: `NetifyClient`가 HTTP 204 No Content와 같이 본문이 없는 성공적인 응답을 `EmptyResponse` 타입으로 올바르게 처리하는지 검증합니다.
-     * @Given: `MockNetworkSession`에 204 응답과 빈 데이터가 설정되어 있습니다. `EmptyResponse`를 기대하는 `DeleteMockItemRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `EmptyResponse` 타입의 결과가 성공적으로 반환되는지 단언합니다 (nil이 아님).
-     */
-    func testMock_EmptyResponseSuccess() async throws { // throws 추가
+    func testMock_EmptyResponseSuccess() async throws {
         // Given
-        let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/delete/item/5"))
-        let mockResponse = HTTPURLResponse(url: url, statusCode: 204, httpVersion: "HTTP/1.1", headerFields: nil)!
-
-        mockNetworkSession.mockResponse = mockResponse
-        mockNetworkSession.mockData = Data() // 빈 데이터
-
-        let request = DeleteMockItemRequest(itemId: 5) // EmptyResponse 기대
+        let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/items/5"))
+        let mockNoContentResponse = HTTPURLResponse(url: url, statusCode: 204, httpVersion: "HTTP/1.1", headerFields: nil)!
+        mockNetworkSession.mockResponse = mockNoContentResponse
+        mockNetworkSession.mockData = Data() // Empty data for 204
+        let request = DeleteMockItemRequest(itemId: 5)
 
         // When
         let result: EmptyResponse = try await mockNetifyClient.send(request)
-
+        
         // Then
-        // 성공적으로 EmptyResponse를 받았는지 확인 (별도 값 비교는 불필요)
-        XCTAssertNotNil(result) // 타입 캐스팅 및 반환 성공 여부 확인
+        XCTAssertNotNil(result) // Successfully received and mapped to EmptyResponse
     }
 
-    /**
-     * @Intent: `NetifyClient`가 `EmptyResponse`나 `Data`가 아닌 타입을 기대할 때 빈 응답 데이터를 수신하면 `NetworkRequestError.decodingError`를 발생시키는지 검증합니다.
-     * @Given: `MockNetworkSession`에 200 OK 응답과 빈 데이터가 설정되어 있습니다. `MockUser`를 기대하는 `GetMockUserRequest`가 준비됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.decodingError` 오류가 발생하고, 연관된 데이터가 비어 있으며, 내재된 오류의 설명에 "Expected non-empty response body"가 포함되어 있는지 단언합니다.
-     */
-    func testMock_EmptyResponseForNonEmptyType_DecodingError() async throws { // throws 추가
+    func testMock_EmptyResponseForNonEmptyType_DecodingError() async throws {
         // Given
         let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/users/1"))
+        let mockOKEmptyDataResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        mockNetworkSession.mockResponse = mockOKEmptyDataResponse
+        mockNetworkSession.mockData = Data() // Empty data
+        let request = GetMockUserRequest(userId: 1) // Expects MockUser
+
+        // When/Then
+        do {
+            _ = try await mockNetifyClient.send(request)
+            XCTFail("Expected NetworkRequestError.decodingError for empty data with non-EmptyResponse type")
+        } catch let error as NetworkRequestError {
+            if case .decodingError(let underlyingError, let data) = error {
+                XCTAssertEqual(data, Data())
+                XCTAssert(underlyingError.localizedDescription.contains("타입을 기대했으나 빈 응답 본문을 받았습니다"), "Error message mismatch: \(underlyingError.localizedDescription)")
+            } else { XCTFail("Expected .decodingError, got \(error)") }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
+    }
+    
+    func testMock_NetworkError_NotConnected() async throws {
+        // Given
+        mockNetworkSession.simulateError = URLError(.notConnectedToInternet)
+        let request = GetMockUserRequest(userId: 1)
+
+        // When/Then
+        do {
+            _ = try await mockNetifyClient.send(request)
+            XCTFail("Expected NetworkRequestError.noInternetConnection")
+        } catch let error as NetworkRequestError {
+            guard case .noInternetConnection = error else { XCTFail("Expected .noInternetConnection, got \(error)"); return }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
+    }
+
+    func testMock_NetworkError_Timeout() async throws {
+        // Given
+        mockNetworkSession.simulateError = URLError(.timedOut)
+        let request = GetMockUserRequest(userId: 1)
+
+        // When/Then
+        do {
+            _ = try await mockNetifyClient.send(request)
+            XCTFail("Expected NetworkRequestError.timedOut")
+        } catch let error as NetworkRequestError {
+            guard case .timedOut = error else { XCTFail("Expected .timedOut, got \(error)"); return }
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
+    }
+
+    func testMock_NetworkError_BadURL() async throws {
+        // Given
+        mockNetworkSession.simulateError = URLError(.badURL)
+        let request = GetMockUserRequest(userId: 1)
+
+        // When/Then
+        do {
+            _ = try await mockNetifyClient.send(request)
+            XCTFail("Expected NetworkRequestError.urlSessionFailed")
+        } catch let error as NetworkRequestError {
+            if case .urlSessionFailed(let underlyingError) = error {
+                XCTAssertEqual((underlyingError as? URLError)?.code, .badURL)
+            } else { XCTFail("Expected .urlSessionFailed with URLError.badURL, got \(error)")}
+        } catch { XCTFail("Expected NetworkRequestError, got \(error)") }
+    }
+    
+    // MARK: - Mock Based Unit Tests (NEW: Declarative API)
+    
+    /**
+     * @Intent: 선언적 API GET 요청(경로 인자, 쿼리 파라미터, 헤더 포함)의 성공 및 응답 디코딩을 검증합니다.
+     * @Given: `MockUser` 데이터와 200 OK 응답이 `MockNetworkSession`에 설정됩니다. 선언적 API로 요청이 구성됩니다.
+     * @When: `mockNetifyClient.send()`로 선언적 요청을 전송합니다.
+     * @Then: 반환된 `MockUser`가 예상과 같고, 요청 URL, 메소드, 헤더가 올바른지 확인합니다.
+     */
+    func testMock_Declarative_SuccessfulGETRequest_WithParamsAndHeaders() async throws {
+        // Given
+        let expectedUser = MockUser(id: 7, name: "Declarative User")
+        let mockData = try JSONEncoder().encode(expectedUser)
+        // URL 구성 시 쿼리 파라미터 순서는 중요하지 않으므로, 검증 시 Set으로 비교
+        let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/declarative/users/7?type=active&role=admin"))
+        let mockResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+
+        mockNetworkSession.mockData = mockData
+        mockNetworkSession.mockResponse = mockResponse
+
+        let declarativeRequest = Netify.get(expecting: MockUser.self)
+            .path("/declarative/users/{userID}")
+            .pathArgument("userID", 7)
+            .queryParam("type", "active")
+            .queryParam("role", "admin") // 쿼리 파라미터 순서 변경하여 테스트 가능
+            .header("X-Custom-ID", "declarative-test-001")
+            .authentication(required: false)
+
+        // When
+        let user: MockUser = try await mockNetifyClient.send(declarativeRequest)
+
+        // Then
+        XCTAssertEqual(user, expectedUser, "Decoded user mismatch")
+        
+        let lastRequest = try XCTUnwrap(mockNetworkSession.lastRequest)
+        let lastURL = try XCTUnwrap(lastRequest.url)
+        
+        XCTAssertEqual(lastURL.path, "/declarative/users/7", "Request path mismatch")
+        
+        let expectedQueryItems = Set([URLQueryItem(name: "type", value: "active"), URLQueryItem(name: "role", value: "admin")])
+        let actualQueryItems = Set(URLComponents(url: lastURL, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+        XCTAssertEqual(actualQueryItems, expectedQueryItems, "Query parameters mismatch")
+        
+        XCTAssertEqual(lastRequest.httpMethod, "GET", "HTTP method mismatch")
+        XCTAssertEqual(lastRequest.value(forHTTPHeaderField: "X-Custom-ID"), "declarative-test-001", "Custom header mismatch")
+    }
+
+    /**
+     * @Intent: 선언적 API POST 요청(JSON 본문)의 성공, 요청 본문 인코딩, Content-Type 설정, 응답 디코딩을 검증합니다.
+     * @Given: `MockUserResponse` 데이터와 201 Created 응답이 `MockNetworkSession`에 설정됩니다. 선언적 API로 POST 요청이 구성됩니다.
+     * @When: `mockNetifyClient.send()`로 선언적 요청을 전송합니다.
+     * @Then: 반환된 응답이 예상과 같고, 요청 URL, 메소드, 본문(디코딩 후 비교), Content-Type 헤더가 올바른지 확인합니다.
+     */
+    func testMock_Declarative_SuccessfulPOSTRequest_WithJSONBody() async throws {
+        // Given
+        let inputUserPayload = MockUserInput(name: "Declarative POST", job: "Architect")
+        let now = Date()
+        let expectedResponseUser = MockUserResponse(id: "789", name: inputUserPayload.name, job: inputUserPayload.job, createdAt: now)
+        
+        let mockResponseData = try mockNetifyClient.configuration.defaultEncoder.encode(expectedResponseUser)
+        
+        let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/declarative/users"))
+        let mockResponse = HTTPURLResponse(url: url, statusCode: 201, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+
+        mockNetworkSession.mockData = mockResponseData
+        mockNetworkSession.mockResponse = mockResponse
+
+        let declarativeRequest = Netify.post(expecting: MockUserResponse.self)
+            .path("/declarative/users")
+            .body(inputUserPayload) // .json contentType 자동 설정 기대
+            .header("X-Action", "CreateUser-Declarative")
+
+        // When
+        let createdUserResponse: MockUserResponse = try await mockNetifyClient.send(declarativeRequest)
+
+        // Then
+        XCTAssertEqual(createdUserResponse.name, expectedResponseUser.name)
+        XCTAssertEqual(createdUserResponse.job, expectedResponseUser.job)
+        XCTAssertEqual(createdUserResponse.id, expectedResponseUser.id)
+        XCTAssertEqual(createdUserResponse.createdAt.timeIntervalSince1970, expectedResponseUser.createdAt.timeIntervalSince1970, accuracy: 1.0)
+
+        let lastRequest = try XCTUnwrap(mockNetworkSession.lastRequest)
+        XCTAssertEqual(lastRequest.url?.absoluteString, "\(mockBaseURL)/declarative/users")
+        XCTAssertEqual(lastRequest.httpMethod, "POST")
+        
+        guard let actualBodyData = lastRequest.httpBody else {
+            XCTFail("Actual request body data is nil"); return
+        }
+        let actualInputPayload = try mockNetifyClient.configuration.defaultDecoder.decode(MockUserInput.self, from: actualBodyData)
+        XCTAssertEqual(actualInputPayload, inputUserPayload, "Decoded request body mismatch")
+        
+        XCTAssertEqual(lastRequest.value(forHTTPHeaderField: HTTPHeaderField.contentType.rawValue), HTTPContentType.json.rawValue)
+        XCTAssertEqual(lastRequest.value(forHTTPHeaderField: "X-Action"), "CreateUser-Declarative")
+    }
+
+    /**
+     * @Intent: 선언적 API 멀티파트 POST 요청의 성공 및 Content-Type, 본문 구성을 검증합니다.
+     * @Given: `EmptyResponse`와 200 OK 응답이 `MockNetworkSession`에 설정됩니다. 선언적 API로 멀티파트 요청이 구성됩니다.
+     * @When: `mockNetifyClient.send()`로 선언적 요청을 전송합니다.
+     * @Then: 요청이 성공하고, Content-Type이 멀티파트 형식(boundary 포함)이며, 본문에 파트 데이터가 포함되었는지 확인합니다.
+     */
+    func testMock_Declarative_SuccessfulPOSTRequest_WithMultipartBody() async throws {
+        // Given
+        let textData = "Netify Declarative Multipart Test".data(using: .utf8)!
+        let fileDataContent = "Fake image content".data(using: .utf8)!
+
+        let multipartParts = [
+            MultipartData(name: "description", fileData: textData, fileName: "", mimeType: "text/plain"),
+            MultipartData(name: "image_file", fileData: fileDataContent, fileName: "photo.png", mimeType: "image/png")
+        ]
+        
+        let url = try XCTUnwrap(URL(string: "\(mockBaseURL)/declarative/upload_multipart"))
+        let mockResponseData = Data() // EmptyResponse를 기대하므로 빈 데이터
         let mockResponse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
 
+        mockNetworkSession.mockData = mockResponseData
         mockNetworkSession.mockResponse = mockResponse
-        mockNetworkSession.mockData = Data() // 빈 데이터
 
-        let request = GetMockUserRequest(userId: 1) // MockUser를 기대하지만 빈 데이터 수신
-
-        // When/Then
-        do {
-            _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.decodingError due to empty data for non-EmptyResponse type, but got success")
-        } catch let error as NetworkRequestError {
-            // Then
-            if case .decodingError(let underlyingError, let data) = error {
-                XCTAssertEqual(data, Data(), "Data should be empty")
-                // NetifyClient의 handleResponse 로직에서 생성된 에러 메시지 확인
-                XCTAssert(underlyingError.localizedDescription.contains("Expected non-empty response body"), "Error description mismatch, got: \(underlyingError.localizedDescription)")
-            } else {
-                XCTFail("Expected .decodingError but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
-    }
-
-    /**
-     * @Intent: `NetifyClient`가 `URLError.notConnectedToInternet` 오류를 `NetworkRequestError.noInternetConnection`으로 올바르게 매핑하는지 검증합니다.
-     * @Given: `MockNetworkSession`이 `URLError.notConnectedToInternet` 오류를 시뮬레이션하도록 설정됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.noInternetConnection` 오류가 발생하는지 단언합니다.
-     */
-    func testMock_NetworkError_NotConnected() async throws { // throws 추가
-        // Given
-        let simulatedError = URLError(.notConnectedToInternet)
-        mockNetworkSession.simulateError = simulatedError
-        let request = GetMockUserRequest(userId: 1)
-
-        // When/Then
-        do {
-            _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.noInternetConnection but got success")
-        } catch let error as NetworkRequestError {
-            // Then
-            // NetifyClient.mapToNetifyError에서 URLError(.notConnectedToInternet)를 .noInternetConnection으로 매핑하는지 확인
-            if case .noInternetConnection = error {
-                // OK
-            } else {
-                XCTFail("Expected .noInternetConnection but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
-    }
-
-    /**
-     * @Intent: `NetifyClient`가 `URLError.timedOut` 오류를 `NetworkRequestError.timedOut`으로 올바르게 매핑하는지 검증합니다.
-     * @Given: `MockNetworkSession`이 `URLError.timedOut` 오류를 시뮬레이션하도록 설정됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.timedOut` 오류가 발생하는지 단언합니다.
-     */
-    func testMock_NetworkError_Timeout() async throws { // throws 추가
-        // Given
-        let simulatedError = URLError(.timedOut)
-        mockNetworkSession.simulateError = simulatedError
-        let request = GetMockUserRequest(userId: 1)
-
-        // When/Then
-        do {
-            _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.timedOut but got success")
-        } catch let error as NetworkRequestError {
-            // Then
-            // NetifyClient.mapToNetifyError에서 URLError(.timedOut)을 .timedOut으로 매핑하는지 확인
-            if case .timedOut = error {
-                // OK
-            } else {
-                XCTFail("Expected .timedOut but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
-    }
-
-    /**
-     * @Intent: `NetifyClient`가 `URLError.badURL`과 같은 기타 `URLError`를 `NetworkRequestError.urlSessionFailed`로 올바르게 매핑하고, 원본 `URLError`를 포함하는지 검증합니다.
-     * @Given: `MockNetworkSession`이 `URLError.badURL` 오류를 시뮬레이션하도록 설정됩니다.
-     * @When: `mockNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.urlSessionFailed` 오류가 발생하고, 내재된 오류가 `URLError` 타입이며 코드가 `.badURL`인지 단언합니다.
-     */
-    func testMock_NetworkError_BadURL() async throws { // throws 추가
-        // Given
-        let simulatedError = URLError(.badURL) // Mock에서 URLSession 레벨 에러 시뮬레이션
-        mockNetworkSession.simulateError = simulatedError
-        let request = GetMockUserRequest(userId: 1)
-
-        // When/Then
-        do {
-            _ = try await mockNetifyClient.send(request)
-            XCTFail("Expected NetworkRequestError.urlSessionFailed(badURL) but got success")
-        } catch let error as NetworkRequestError {
-            // Then
-            // NetifyClient.mapToNetifyError에서 기타 URLError를 .urlSessionFailed로 매핑하는지 확인
-            if case .urlSessionFailed(let underlyingError) = error {
-                guard let urlErr = underlyingError as? URLError else {
-                    XCTFail("Underlying error should be URLError but was \(type(of: underlyingError))")
-                    return
-                }
-                XCTAssertEqual(urlErr.code, .badURL)
-            } else {
-                XCTFail("Expected .urlSessionFailed(URLError.badURL) but received \(error)")
-            }
-        } catch {
-            XCTFail("Expected NetworkRequestError but got \(error)")
-        }
-    }
-
-    // MARK: - Integration Tests (using JSONPlaceholder)
-
-    /**
-     * @Intent: `integrationNetifyClient`를 사용하여 JSONPlaceholder API에서 특정 게시물을 성공적으로 가져오고, 해당 게시물의 내용을 검증합니다.
-     * @Given: `integrationNetifyClient`가 JSONPlaceholder API를 대상으로 설정되어 있고, ID가 1인 게시물을 요청하는 `GetPlaceholderPostRequest`가 준비됩니다.
-     * @When: `integrationNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: 반환된 `PlaceholderPost` 객체의 `id`, `userId`, `title`, `body`가 JSONPlaceholder의 ID 1 게시물 데이터와 일치하는지 단언합니다.
-     */
-    func testIntegration_fetchSinglePost_Success() async throws {
-        // Given
-        let postIdToFetch = 1
-        let request = GetPlaceholderPostRequest(postId: postIdToFetch)
+        let declarativeRequest = Netify.post(expecting: EmptyResponse.self)
+            .path("/declarative/upload_multipart")
+            .multipart(multipartParts)
 
         // When
-        let post = try await integrationNetifyClient.send(request)
+        _ = try await mockNetifyClient.send(declarativeRequest)
 
         // Then
+        let lastRequest = try XCTUnwrap(mockNetworkSession.lastRequest)
+        XCTAssertEqual(lastRequest.url?.absoluteString, "\(mockBaseURL)/declarative/upload_multipart")
+        XCTAssertEqual(lastRequest.httpMethod, "POST")
+
+        let contentTypeHeader = try XCTUnwrap(lastRequest.value(forHTTPHeaderField: HTTPHeaderField.contentType.rawValue))
+        XCTAssertTrue(contentTypeHeader.hasPrefix(HTTPContentType.multipart.rawValue))
+        XCTAssertTrue(contentTypeHeader.contains("boundary="))
+
+        let actualBodyData = try XCTUnwrap(lastRequest.httpBody)
+        XCTAssertFalse(actualBodyData.isEmpty)
+        
+        let bodyString = String(data: actualBodyData, encoding: .utf8) ?? ""
+        XCTAssertTrue(bodyString.contains("name=\"description\""))
+        XCTAssertTrue(bodyString.contains(String(data: textData, encoding: .utf8)!))
+        XCTAssertTrue(bodyString.contains("name=\"image_file\""))
+        XCTAssertTrue(bodyString.contains("filename=\"photo.png\""))
+        XCTAssertTrue(bodyString.contains("Content-Type: image/png"))
+        XCTAssertTrue(bodyString.contains(String(data: fileDataContent, encoding: .utf8)!))
+    }
+    
+    // MARK: - Integration Tests
+    // (기존 통합 테스트 코드는 NetifyRequest 프로토콜을 사용하므로 그대로 유지 또는
+    //  선언적 API를 사용하는 버전으로 별도 추가/대체 가능)
+
+    func testIntegration_fetchSinglePost_Success() async throws {
+        let postIdToFetch = 1
+        // 기존 프로토콜 기반 요청
+        // let request = GetPlaceholderPostRequest(postId: postIdToFetch)
+        
+        // 선언적 API로 변경 (예시)
+        let request = Netify.get(expecting: PlaceholderPost.self)
+            .path("/posts/{id}")
+            .pathArgument("id", postIdToFetch)
+            .authentication(required: false) // JSONPlaceholder는 인증 불필요
+
+        let post = try await integrationNetifyClient.send(request)
+        
         XCTAssertEqual(post.id, postIdToFetch)
-        XCTAssertEqual(post.userId, 1) // JSONPlaceholder post 1 has userId 1
+        XCTAssertEqual(post.userId, 1)
         XCTAssertEqual(post.title, "sunt aut facere repellat provident occaecati excepturi optio reprehenderit")
         XCTAssertFalse(post.body.isEmpty)
-        // For more specific body check if needed:
-        // XCTAssertTrue(post.body.starts(with: "quia et suscipit\nsuscipit recusandae consequuntur expedita et cum"))
     }
-
-    /**
-     * @Intent: `integrationNetifyClient`를 사용하여 JSONPlaceholder API에서 모든 게시물을 성공적으로 가져오고, 반환된 목록의 크기와 첫 번째 게시물의 내용을 검증합니다.
-     * @Given: `integrationNetifyClient`가 JSONPlaceholder API를 대상으로 설정되어 있고, 모든 게시물을 요청하는 `GetAllPlaceholderPostsRequest`가 준비됩니다.
-     * @When: `integrationNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: 반환된 `PlaceholderPost` 배열이 비어있지 않고, 100개의 게시물을 포함하며, 첫 번째 게시물의 `id`와 `title`이 올바른지 단언합니다.
-     */
+    
     func testIntegration_fetchAllPosts_Success() async throws {
-        // Given
-        let request = GetAllPlaceholderPostsRequest()
+        // 기존 프로토콜 기반 요청
+        // let request = GetAllPlaceholderPostsRequest()
+        
+        // 선언적 API로 변경 (예시)
+        let request = Netify.get(expecting: [PlaceholderPost].self)
+            .path("/posts")
+            .authentication(required: false)
 
-        // When
         let posts = try await integrationNetifyClient.send(request)
-
-        // Then
-        XCTAssertFalse(posts.isEmpty, "Post list should not be empty")
-        XCTAssertEqual(posts.count, 100, "JSONPlaceholder should return 100 posts for /posts")
+        
+        XCTAssertFalse(posts.isEmpty)
+        XCTAssertEqual(posts.count, 100)
         if let firstPost = posts.first {
-             XCTAssertEqual(firstPost.id, 1) // First post usually has ID 1
-             XCTAssertFalse(firstPost.title.isEmpty)
+            XCTAssertEqual(firstPost.id, 1)
+            XCTAssertFalse(firstPost.title.isEmpty)
         } else {
-            XCTFail("Fetched posts array was empty or nil, which is unexpected for JSONPlaceholder /posts.")
+            XCTFail("Fetched posts array was empty.")
         }
     }
-
-    /**
-     * @Intent: `integrationNetifyClient`를 사용하여 JSONPlaceholder API에 새 게시물을 성공적으로 생성하고, 반환된 게시물 객체의 내용을 검증합니다.
-     * @Given: `integrationNetifyClient`가 JSONPlaceholder API를 대상으로 설정되어 있고, 새 게시물 데이터를 포함하는 `CreatePlaceholderPostRequest`가 준비됩니다.
-     * @When: `integrationNetifyClient.send()`를 통해 요청을 전송합니다.
-     * @Then: 반환된 `PlaceholderPost` 객체가 새로운 `id` (JSONPlaceholder는 보통 101을 반환)를 가지고, `title`, `body`, `userId`가 요청 시 보낸 값과 일치하는지 단언합니다.
-     */
-    func testIntegration_createPost_Success() async throws { // throws 추가
-        // Given
-        let newPostInput = PlaceholderPostInput(userId: 5, title: "Netify Integration Test", body: "This post was created during an integration test.")
-        let request = CreatePlaceholderPostRequest(postInput: newPostInput)
-
-        // When
+    
+    func testIntegration_createPost_Success() async throws {
+        let newPostInput = PlaceholderPostInput(userId: 5, title: "Netify Declarative Integration Test", body: "This post was created via declarative API.")
+        // 기존 프로토콜 기반 요청
+        // let request = CreatePlaceholderPostRequest(postInput: newPostInput)
+        
+        // 선언적 API로 변경 (예시)
+        let request = Netify.post(expecting: PlaceholderPost.self)
+            .path("/posts")
+            .body(newPostInput) // contentType은 .json으로 자동 설정
+            .authentication(required: false)
+        
         let createdPost: PlaceholderPost = try await integrationNetifyClient.send(request)
-
-        // Then
-        XCTAssertNotNil(createdPost.id) // JSONPlaceholder는 새 ID를 반환 (보통 101)
+        
+        XCTAssertNotNil(createdPost.id)
         XCTAssertGreaterThanOrEqual(createdPost.id, 101) // JSONPlaceholder는 보통 101부터 시작
         XCTAssertEqual(createdPost.title, newPostInput.title)
         XCTAssertEqual(createdPost.body, newPostInput.body)
         XCTAssertEqual(createdPost.userId, newPostInput.userId)
     }
-
-    /**
-     * @Intent: `NetifyClient`를 사용하여 HTTPBin API의 `/status/404` 엔드포인트가 올바르게 HTTP 404 오류를 반환하는지 검증합니다.
-     * @Given: HTTPBin API (`https://httpbin.org`)를 대상으로 하는 `NetifyClient` 인스턴스와, 상태 코드 404를 요청하는 `GetHttpBinStatusRequest`가 준비됩니다.
-     * @When: 해당 클라이언트로 `send()`를 통해 요청을 전송합니다.
-     * @Then: `NetworkRequestError.notFound` 오류가 발생하고, 해당 오류에 포함된 데이터가 (HTTPBin의 경우 보통 비어있거나 HTML) nil이 아닌지 단언합니다.
-     */
+    
     func testIntegration_HttpBin_Returns404Error() async throws {
-        // Given
         let httpBinBaseURL = "https://httpbin.org"
-        let httpBinConfig = NetifyConfiguration(
-            baseURL: httpBinBaseURL,
-            logLevel: .debug, // HTTPBin 테스트 시 로깅 레벨
-            maxRetryCount: 1   // HTTPBin에 대한 재시도 횟수 (선택 사항)
-        )
+        let httpBinConfig = NetifyConfiguration(baseURL: httpBinBaseURL, logLevel: .debug, maxRetryCount: 0) // 재시도 없이 테스트
         let httpBinClient = NetifyClient(configuration: httpBinConfig)
         
-        let request = GetHttpBinStatusRequest(statusCode: 404)
-
-        // When/Then
+        // 기존 프로토콜 기반 요청
+        // let request = GetHttpBinStatusRequest(statusCode: 404)
+        
+        // 선언적 API로 변경 (예시)
+        let request = Netify.get(expecting: Data.self) // HTTPBin은 HTML 등을 반환할 수 있어 Data로 받음
+            .path("/status/{code}")
+            .pathArgument("code", 404)
+            .authentication(required: false)
+            
         do {
-            _ = try await httpBinClient.send(request) // Expecting EmptyResponse or Data
-            XCTFail("Request to HTTPBin /status/404 should have failed with .notFound error.")
+            _ = try await httpBinClient.send(request)
+            XCTFail("Request to HTTPBin /status/404 should have failed.")
         } catch let error as NetworkRequestError {
             if case .notFound(let data) = error {
-                XCTAssertNotNil(data, "Data from HTTPBin 404 should not be nil, though it might be empty or HTML.")
-                // HTTPBin /status/404는 보통 빈 본문 또는 HTML 오류 페이지를 반환합니다.
-                // print("HTTPBin 404 response data string: \(String(data: data ?? Data(), encoding: .utf8) ?? "nil or non-UTF8")")
+                XCTAssertNotNil(data, "Data from HTTPBin 404 should not be nil.")
             } else {
-                XCTFail("Expected .notFound error from HTTPBin but received \(error)")
+                XCTFail("Expected .notFound from HTTPBin, got \(error)")
             }
         } catch {
-            XCTFail("Expected NetworkRequestError but got a different error type: \(error)")
+            XCTFail("Expected NetworkRequestError, got \(error)")
         }
     }
 }
@@ -521,73 +519,63 @@ final class NetifyTests: XCTestCase {
 // MARK: - Helper Functions for Tests
 @available(iOS 15, macOS 12, *)
 extension NetifyTests {
-    /// Creates a NetifyClient instance configured for integration tests against JSONPlaceholder.
     func makeRealNetifyClient() -> NetifyClient {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
+        
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        
         let config = NetifyConfiguration(
             baseURL: integrationBaseURL,
-            logLevel: .debug, // 통합 테스트 시 로깅 레벨 조정 가능
-            maxRetryCount: 2, // JSONPlaceholder에 대한 재시도 횟수 추가
-            timeoutInterval: 45.0, // 타임아웃 약간 증가 (선택 사항)
-            waitsForConnectivity: false // 네트워크 연결 대기 옵션 활성화
+            defaultEncoder: encoder, // 통합 테스트에도 일관된 인코더 적용
+            defaultDecoder: decoder,
+            logLevel: .debug,
+            maxRetryCount: 1, // 통합 테스트 시 재시도 1회
+            timeoutInterval: 30.0,
+            waitsForConnectivity: false
         )
-        // 실제 URLSession을 사용하도록 networkSession 파라미터 생략
         return NetifyClient(configuration: config)
     }
 }
 
 // MARK: - Mock Types for Unit Tests
-
-/// Mock NetworkSession conforming to the NetworkSessionProtocol (defined in Netify module)
 @available(iOS 15, macOS 12, *)
-class MockNetworkSession: NetworkSessionProtocol { // Netify 모듈의 프로토콜 준수
-
+class MockNetworkSession: NetworkSessionProtocol {
     var lastRequest: URLRequest?
     var mockData: Data?
     var mockResponse: URLResponse?
     var simulateError: Error?
-
-    // NetworkSessionProtocol의 요구사항 구현
+    
     func data(for request: URLRequest, delegate: URLSessionTaskDelegate? = nil) async throws -> (Data, URLResponse) {
         lastRequest = request
-
-        if let error = simulateError {
-            throw error // 시뮬레이션할 에러를 throw
-        }
-
-        // 응답(mockResponse)이 설정되지 않았으면 테스트 설정 오류로 간주
+        if let error = simulateError { throw error }
         guard let response = mockResponse else {
-             throw NSError(domain: "MockNetworkSessionError", code: -999, userInfo: [NSLocalizedDescriptionKey: "MockNetworkSession requires a mockResponse to be set for non-error cases."])
+            throw NSError(domain: "MockNetworkSessionError", code: 1, userInfo: [NSLocalizedDescriptionKey: "mockResponse is nil."])
         }
-
-        // 설정된 mockData 또는 빈 Data와 mockResponse 반환
         return (mockData ?? Data(), response)
     }
 }
 
-// MARK: - Helper Types for Mock Tests (변경 없음)
+// MARK: - Helper Types for Mock Tests
 struct MockUser: Codable, Equatable {
-    let id: Int
-    let name: String
+    let id: Int; let name: String
 }
 
 struct MockUserInput: Codable, Equatable {
-    let name: String
-    let job: String
+    let name: String; let job: String
 }
 
 struct MockUserResponse: Codable, Equatable {
-    let id: String
-    let name: String
-    let job: String
-    let createdAt: Date // Date 타입은 인코딩/디코딩 전략 및 비교 방식 주의
+    let id: String; let name: String; let job: String; let createdAt: Date
 }
 
 struct MockItem: Codable, Equatable {
-    let itemId: Int
-    let description: String
+    let itemId: Int; let description: String
 }
 
-// MARK: - NetifyRequest Implementations for Mock Tests (변경 없음)
+// MARK: - NetifyRequest Implementations for Mock Tests (Protocol Based)
 @available(iOS 15, macOS 12, *)
 struct GetMockUserRequest: NetifyRequest {
     typealias ReturnType = MockUser
@@ -602,7 +590,7 @@ struct CreateMockUserRequest: NetifyRequest {
     var method: HTTPMethod = .post
     let userInput: MockUserInput
     var body: Any? { userInput }
-    // NetifyRequest 기본 구현으로 contentType은 .json으로 가정
+    // contentType은 .json으로 기본 설정됨
 }
 
 @available(iOS 15, macOS 12, *)
@@ -614,41 +602,35 @@ struct GetMockItemRequest: NetifyRequest {
 
 @available(iOS 15, macOS 12, *)
 struct DeleteMockItemRequest: NetifyRequest {
-     typealias ReturnType = EmptyResponse
-     let itemId: Int
-     var path: String { "/delete/item/\(itemId)" }
-     var method: HTTPMethod = .delete
+    typealias ReturnType = EmptyResponse
+    let itemId: Int
+    var path: String { "/delete/item/\(itemId)" }
+    var method: HTTPMethod = .delete
 }
 
 @available(iOS 15, macOS 12, *)
 struct GetMockStatusRequest: NetifyRequest {
-     typealias ReturnType = Data // Mock 서버가 에러 본문을 반환할 수 있으므로 Data로 받는 것이 더 유연할 수 있음
-     let code: Int
-     var path: String { "/status/\(code)" }
+    typealias ReturnType = Data // 에러 본문은 Data로 받는 것이 유연함
+    let code: Int
+    var path: String { "/status/\(code)" }
 }
 
-
-// MARK: - Helper Types for Integration Tests (변경 없음)
+// MARK: - Helper Types for Integration Tests
 struct PlaceholderPost: Codable, Equatable, Identifiable {
-    let userId: Int
-    let id: Int
-    let title: String
-    let body: String
+    let userId: Int; let id: Int; let title: String; let body: String
 }
 
 struct PlaceholderPostInput: Codable, Equatable {
-    let userId: Int
-    let title: String
-    let body: String
+    let userId: Int; let title: String; let body: String
 }
 
-// MARK: - NetifyRequest Implementations for Integration Tests (변경 없음)
+// MARK: - NetifyRequest Implementations for Integration Tests (Protocol Based)
 @available(iOS 15, macOS 12, *)
 struct GetPlaceholderPostRequest: NetifyRequest {
     typealias ReturnType = PlaceholderPost
     let postId: Int
     var path: String { "/posts/\(postId)" }
-    var requiresAuthentication: Bool = false // JSONPlaceholder는 인증 불필요
+    var requiresAuthentication: Bool = false
 }
 
 @available(iOS 15, macOS 12, *)
@@ -660,19 +642,17 @@ struct GetAllPlaceholderPostsRequest: NetifyRequest {
 
 @available(iOS 15, macOS 12, *)
 struct CreatePlaceholderPostRequest: NetifyRequest {
-    typealias ReturnType = PlaceholderPost // 생성 후 응답으로 Post 객체 받음
+    typealias ReturnType = PlaceholderPost
     let path = "/posts"
     let method: HTTPMethod = .post
     let postInput: PlaceholderPostInput
     var body: Any? { postInput }
     var requiresAuthentication: Bool = false
-    // 기본 contentType = .json 사용
 }
 
-// HTTPBin 테스트용 NetifyRequest
 @available(iOS 15, macOS 12, *)
 struct GetHttpBinStatusRequest: NetifyRequest {
-    typealias ReturnType = Data // HTTPBin은 HTML이나 다른 내용을 반환할 수 있으므로 Data로 받음
+    typealias ReturnType = Data
     let statusCode: Int
     var path: String { "/status/\(statusCode)" }
     var requiresAuthentication: Bool = false
