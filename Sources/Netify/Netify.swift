@@ -855,73 +855,10 @@ public final class NetifyClient: NetifyClientProtocol {
         let attemptStarted = Date()
         var urlRequest: URLRequest = try await buildAndLogRequest(from: request)
         
-        // ---- Simple Cache (GET만 기본 대상) ----
-        let useCache = configuration.responseCache != nil && request.method == .get
-        let baseKeyAndEffective: (base: String, key: String)? = {
-            guard useCache, let url = urlRequest.url else { return nil }
-            let base = CacheKey.make(method: request.method.rawValue, url: url)
-            return (base, base)
-        }()
-        var cacheKey: String? = baseKeyAndEffective?.key
-        if let pair = baseKeyAndEffective {
-            let names = await varyIndex.get(for: pair.base)
-            if let url = urlRequest.url, !names.isEmpty {
-                let varyParts: [String] = names.map { name in
-                    let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
-                    return "\(name)=\(v)"
-                }
-                cacheKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
-            }
-        }
-        var cached: (status: Int, headers: HTTPHeaders, data: Data, storedAt: Date)?
-        if let key = cacheKey, useCache {
-            if let cache = configuration.responseCache {
-                cached = await cache.read(key: key)
-            }
-            if let cached, case .ttl(let seconds) = configuration.cache {
-                if Date().timeIntervalSince(cached.storedAt) < seconds {
-                    logger.log(message: "TTL cache hit for \(key)", level: .info)
-                    let result = try self.decodeSuccess(data: cached.data, for: request)
-                    if let url = urlRequest.url,
-                       let resp = HTTPURLResponse(url: url, statusCode: cached.status, httpVersion: nil, headerFields: cached.headers) {
-                        configuration.plugins.forEach { $0.didReceive(.success((cached.data, resp)), for: urlRequest) }
-                    }
-                    configuration.metrics.recordRequest(
-                        path: request.path, method: request.method.rawValue,
-                        duration: Date().timeIntervalSince(attemptStarted),
-                        status: 200, retryCount: currentRetryCount
-                    )
-                    return result
-                }
-            }
-            if let cached, case .etag = configuration.cache {
-                if let etag = cached.headers["etag"] {
-                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
-                    hdrs["If-None-Match"] = etag
-                    urlRequest.allHTTPHeaderFields = hdrs
-                }
-            }
-            if let cached, case .etagOrTtl(let seconds) = configuration.cache {
-                if Date().timeIntervalSince(cached.storedAt) < seconds {
-                    logger.log(message: "TTL(etagOrTtl) cache hit for \(key)", level: .info)
-                    let result = try self.decodeSuccess(data: cached.data, for: request)
-                    if let url = urlRequest.url,
-                       let resp = HTTPURLResponse(url: url, statusCode: cached.status, httpVersion: nil, headerFields: cached.headers) {
-                        configuration.plugins.forEach { $0.didReceive(.success((cached.data, resp)), for: urlRequest) }
-                    }
-                    configuration.metrics.recordRequest(
-                        path: request.path, method: request.method.rawValue,
-                        duration: Date().timeIntervalSince(attemptStarted),
-                        status: 200, retryCount: currentRetryCount
-                    )
-                    return result
-                }
-                if let etag = cached.headers["etag"] {
-                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
-                    hdrs["If-None-Match"] = etag
-                    urlRequest.allHTTPHeaderFields = hdrs
-                }
-            }
+        // Cache handling
+        let (cacheResult, cacheKey, cached) = await handleCacheRead(request: request, urlRequest: &urlRequest, attemptStarted: attemptStarted, currentRetryCount: currentRetryCount)
+        if let result = cacheResult {
+            return result
         }
         
         // Plugins: willSend
@@ -960,72 +897,264 @@ public final class NetifyClient: NetifyClientProtocol {
                 )
             }
             
-            if let http = response as? HTTPURLResponse,
-               (200...299).contains(http.statusCode),
-               let key = cacheKey, useCache, let cache = configuration.responseCache {
-                let headers: HTTPHeaders = requestBuilder.normalizedHeaders(http)
-                var writeKey = key
-                if let base = baseKeyAndEffective?.base,
-                   let varyValue = headers["vary"], !varyValue.isEmpty,
-                   let url = urlRequest.url {
-                    let names = varyValue
-                        .split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-                        .filter { !$0.isEmpty }
-                    if !names.isEmpty {
-                        await varyIndex.set(names, for: base)
-                        let varyParts: [String] = names.map { name in
-                            let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
-                            return "\(name)=\(v)"
-                        }
-                        writeKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
-                    }
-                }
-                switch configuration.cache {
-                case .none: break
-                case .ttl, .etag, .etagOrTtl:
-                    await cache.write(key: writeKey, status: http.statusCode, headers: headers, data: data, storedAt: Date())
-                }
-            }
+            // Cache write
+            await handleCacheWrite(request: request, response: response, data: data, cacheKey: cacheKey, urlRequest: urlRequest)
             return value
         } catch let error {
-            let netifyError = mapToNetifyError(error)
-            logger.log(error: netifyError, level: .error)
-            configuration.plugins.forEach { $0.didReceive(.failure(netifyError), for: urlRequest) }
-            
-            if request.requiresAuthentication,
-               let authProvider = configuration.authenticationProvider,
-               authProvider.isAuthenticationExpired(from: netifyError) {
-                guard authRetryCount < 1 else { throw netifyError }
-                logger.log(message: "인증 만료 감지. 토큰 갱신 시도...", level: .info)
-                let refreshSuccess = await attemptAuthRefresh(using: authProvider)
-                
-                if refreshSuccess {
-                    logger.log(message: "인증 토큰 갱신 성공. 원본 요청 재시도...", level: .info)
-                    return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount, authRetryCount: authRetryCount + 1)
-                } else {
-                    logger.log(message: "인증 토큰 갱신 실패 또는 미지원. 원본 에러(\(netifyError.localizedDescription)) 발생.", level: .error)
-                    throw netifyError
-                }
-            }
-            
-            if netifyError.isRetryable && currentRetryCount < configuration.maxRetryCount {
-                let retryAfterSeconds: TimeInterval? = {
-                    if case let .clientError(code, _, ra) = netifyError, code == 429 { return ra }
-                    if case let .serverError(_, _, ra) = netifyError { return ra }
-                    return nil
-                }()
-                let delayNs = computeRetryDelayNanoseconds(attempt: currentRetryCount + 1, retryAfter: retryAfterSeconds)
-                logger.log(message: "재시도 가능 에러 발생. 재시도 (\(currentRetryCount + 1)/\(configuration.maxRetryCount)), 대기 (\(Double(delayNs)/1_000_000_000))s. 에러: \(netifyError.localizedDescription)", level: .info)
-                try? await Task.sleep(nanoseconds: delayNs)
-                try Task.checkCancellation()
-                return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount + 1, authRetryCount: authRetryCount)
-            }
-            configuration.metrics.recordError(path: request.path, method: request.method.rawValue, error: netifyError)
-            throw netifyError
+            // Error handling with retry logic
+            return try await handleErrorWithRetry(
+                error: error,
+                request: request,
+                urlRequest: urlRequest,
+                currentRetryCount: currentRetryCount,
+                authRetryCount: authRetryCount
+            )
         }
     }
 
+    // MARK: - Cache Management
+    private func handleCacheRead<Request: NetifyRequest>(
+        request: Request,
+        urlRequest: inout URLRequest,
+        attemptStarted: Date,
+        currentRetryCount: Int
+    ) async -> (result: Request.ReturnType?, cacheKey: String?, cached: (status: Int, headers: HTTPHeaders, data: Data, storedAt: Date)?) {
+        
+        let useCache = configuration.responseCache != nil && request.method == .get
+        let baseKeyAndEffective: (base: String, key: String)? = {
+            guard useCache, let url = urlRequest.url else { return nil }
+            let base = CacheKey.make(method: request.method.rawValue, url: url)
+            return (base, base)
+        }()
+        var cacheKey: String? = baseKeyAndEffective?.key
+        
+        if let pair = baseKeyAndEffective {
+            let names = await varyIndex.get(for: pair.base)
+            if let url = urlRequest.url, !names.isEmpty {
+                let varyParts: [String] = names.map { name in
+                    let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
+                    return "\(name)=\(v)"
+                }
+                cacheKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
+            }
+        }
+        
+        var cached: (status: Int, headers: HTTPHeaders, data: Data, storedAt: Date)?
+        if let key = cacheKey, useCache {
+            if let cache = configuration.responseCache {
+                cached = await cache.read(key: key)
+            }
+            
+            if let cached, case .ttl(let seconds) = configuration.cache {
+                if Date().timeIntervalSince(cached.storedAt) < seconds {
+                    logger.log(message: "TTL cache hit for \(key)", level: .info)
+                    if let result = try? self.decodeSuccess(data: cached.data, for: request) {
+                        recordCacheHit(request: request, cached: cached, urlRequest: urlRequest, attemptStarted: attemptStarted, currentRetryCount: currentRetryCount)
+                        return (result, key, cached)
+                    }
+                }
+            }
+            
+            if let cached, case .etag = configuration.cache {
+                if let etag = cached.headers["etag"] {
+                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
+                    hdrs["If-None-Match"] = etag
+                    urlRequest.allHTTPHeaderFields = hdrs
+                }
+            }
+            
+            if let cached, case .etagOrTtl(let seconds) = configuration.cache {
+                if Date().timeIntervalSince(cached.storedAt) < seconds {
+                    logger.log(message: "TTL(etagOrTtl) cache hit for \(key)", level: .info)
+                    if let result = try? self.decodeSuccess(data: cached.data, for: request) {
+                        recordCacheHit(request: request, cached: cached, urlRequest: urlRequest, attemptStarted: attemptStarted, currentRetryCount: currentRetryCount)
+                        return (result, key, cached)
+                    }
+                }
+                if let etag = cached.headers["etag"] {
+                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
+                    hdrs["If-None-Match"] = etag
+                    urlRequest.allHTTPHeaderFields = hdrs
+                }
+            }
+        }
+        
+        return (nil, cacheKey, cached)
+    }
+    
+    private func recordCacheHit<Request: NetifyRequest>(
+        request: Request,
+        cached: (status: Int, headers: HTTPHeaders, data: Data, storedAt: Date),
+        urlRequest: URLRequest,
+        attemptStarted: Date,
+        currentRetryCount: Int
+    ) {
+        if let url = urlRequest.url,
+           let resp = HTTPURLResponse(url: url, statusCode: cached.status, httpVersion: nil, headerFields: cached.headers) {
+            configuration.plugins.forEach { $0.didReceive(.success((cached.data, resp)), for: urlRequest) }
+        }
+        configuration.metrics.recordRequest(
+            path: request.path, method: request.method.rawValue,
+            duration: Date().timeIntervalSince(attemptStarted),
+            status: 200, retryCount: currentRetryCount
+        )
+    }
+    
+    private func handleCacheWrite<Request: NetifyRequest>(
+        request: Request,
+        response: URLResponse,
+        data: Data,
+        cacheKey: String?,
+        urlRequest: URLRequest
+    ) async {
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let key = cacheKey,
+              configuration.responseCache != nil && request.method == .get,
+              let cache = configuration.responseCache else {
+            return
+        }
+        
+        let headers: HTTPHeaders = requestBuilder.normalizedHeaders(http)
+        var writeKey = key
+        
+        // Handle Vary header
+        if let varyValue = headers["vary"], !varyValue.isEmpty,
+           let url = urlRequest.url {
+            let names = varyValue
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                .filter { !$0.isEmpty }
+            
+            if !names.isEmpty {
+                let baseKey = CacheKey.make(method: request.method.rawValue, url: url)
+                await varyIndex.set(names, for: baseKey)
+                let varyParts: [String] = names.map { name in
+                    let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
+                    return "\(name)=\(v)"
+                }
+                writeKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
+            }
+        }
+        
+        switch configuration.cache {
+        case .none: 
+            break
+        case .ttl, .etag, .etagOrTtl:
+            await cache.write(key: writeKey, status: http.statusCode, headers: headers, data: data, storedAt: Date())
+        }
+    }
+    
+    // MARK: - Error Handling & Retry Management
+    private func handleErrorWithRetry<Request: NetifyRequest>(
+        error: Error,
+        request: Request,
+        urlRequest: URLRequest,
+        currentRetryCount: Int,
+        authRetryCount: Int
+    ) async throws -> Request.ReturnType {
+        
+        let netifyError = mapToNetifyError(error)
+        
+        // Create enhanced error context for debugging
+        let errorContext = createErrorContext(
+            for: request,
+            urlRequest: urlRequest,
+            attemptNumber: currentRetryCount + 1,
+            totalAttempts: configuration.maxRetryCount + 1
+        )
+        
+        // Enhanced logging with context
+        logger.log(message: netifyError.enhancedDebugDescription(with: errorContext), level: .error)
+        configuration.plugins.forEach { $0.didReceive(.failure(netifyError), for: urlRequest) }
+        
+        // Try authentication refresh first
+        if let result = try await attemptAuthRetryIfNeeded(
+            error: netifyError,
+            request: request,
+            currentRetryCount: currentRetryCount,
+            authRetryCount: authRetryCount
+        ) {
+            return result
+        }
+        
+        // Try standard retry
+        if let result = try await attemptStandardRetryIfNeeded(
+            error: netifyError,
+            request: request,
+            currentRetryCount: currentRetryCount,
+            authRetryCount: authRetryCount
+        ) {
+            return result
+        }
+        
+        // All retry attempts exhausted - record error and throw
+        configuration.metrics.recordError(path: request.path, method: request.method.rawValue, error: netifyError)
+        throw netifyError
+    }
+    
+    private func attemptAuthRetryIfNeeded<Request: NetifyRequest>(
+        error: NetworkRequestError,
+        request: Request,
+        currentRetryCount: Int,
+        authRetryCount: Int
+    ) async throws -> Request.ReturnType? {
+        
+        guard request.requiresAuthentication,
+              let authProvider = configuration.authenticationProvider,
+              authProvider.isAuthenticationExpired(from: error),
+              authRetryCount < 1 else {
+            return nil
+        }
+        
+        logger.log(message: "Authentication expired. Attempting token refresh...", level: .info)
+        let refreshSuccess = await attemptAuthRefresh(using: authProvider)
+        
+        if refreshSuccess {
+            logger.log(message: "Token refresh successful. Retrying original request...", level: .info)
+            return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount, authRetryCount: authRetryCount + 1)
+        } else {
+            logger.log(message: "Token refresh failed. Returning original error: \(error.localizedDescription)", level: .error)
+            return nil // Let caller handle the error
+        }
+    }
+    
+    private func attemptStandardRetryIfNeeded<Request: NetifyRequest>(
+        error: NetworkRequestError,
+        request: Request,
+        currentRetryCount: Int,
+        authRetryCount: Int
+    ) async throws -> Request.ReturnType? {
+        
+        guard error.isRetryable && currentRetryCount < configuration.maxRetryCount else {
+            return nil
+        }
+        
+        let retryAfter = extractRetryAfterFromError(error)
+        let delayNs = computeRetryDelayNanoseconds(attempt: currentRetryCount + 1, retryAfter: retryAfter)
+        
+        logger.log(
+            message: "Retryable error occurred. Retry (\(currentRetryCount + 1)/\(configuration.maxRetryCount)), delay: \(Double(delayNs)/1_000_000_000)s. Error: \(error.localizedDescription)",
+            level: .info
+        )
+        
+        try? await Task.sleep(nanoseconds: delayNs)
+        try Task.checkCancellation()
+        
+        return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount + 1, authRetryCount: authRetryCount)
+    }
+    
+    private func extractRetryAfterFromError(_ error: NetworkRequestError) -> TimeInterval? {
+        switch error {
+        case .clientError(let code, _, let retryAfter) where code == 429:
+            return retryAfter
+        case .serverError(_, _, let retryAfter):
+            return retryAfter
+        default:
+            return nil
+        }
+    }
+    
     // MARK: - Small helpers (complexity reduction)
     private func buildAndLogRequest<Request: NetifyRequest>(from request: Request) async throws -> URLRequest {
         do {
@@ -1060,7 +1189,7 @@ public final class NetifyClient: NetifyClientProtocol {
             do {
                 return try decoder.decode(Request.ReturnType.self, from: data)
             } catch {
-                throw NetworkRequestError.decodingError(underlyingError: error, data: data)
+                throw NetworkRequestError.decodingErrorWithType(from: error, expectedType: Request.ReturnType.self, data: data)
             }
         }
     }
