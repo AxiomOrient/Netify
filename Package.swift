@@ -1,6 +1,5 @@
-// swift-tools-version: 5.7
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
-// swift-tools-version:5.5
 
 import PackageDescription // Keep this line
 
@@ -25,11 +24,6 @@ let package = Package(
         .testTarget(
             name: "NetifyTests",
             dependencies: ["Netify"]
-        ),
-        .executableTarget(
-            name: "NetifyExamples",
-            dependencies: ["Netify"],
-            path: "Examples"
         )
     ]
 )

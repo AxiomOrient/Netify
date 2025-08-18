@@ -71,6 +71,11 @@ public struct NetifyConfiguration: Sendable {
     public let timeoutInterval: TimeInterval
     public let authenticationProvider: AuthenticationProvider?
     public let waitsForConnectivity: Bool
+    public let metrics: NetworkMetrics
+    public let cache: NetifyCachePolicy
+    public let responseCache: ResponseCache?
+    public let sensitiveHeaderKeys: Set<String>
+    public let plugins: [NetifyPlugin]
     
     public init(
         baseURL: String,
@@ -83,7 +88,12 @@ public struct NetifyConfiguration: Sendable {
         maxRetryCount: Int = 0, // 기본적으로 재시도 안 함
         timeoutInterval: TimeInterval = 30.0,
         authenticationProvider: AuthenticationProvider? = nil,
-        waitsForConnectivity: Bool = false // 기본값은 false로 설정 (시스템 기본값은 true)
+        waitsForConnectivity: Bool = false, // 기본값은 false로 설정 (시스템 기본값은 true)
+        metrics: NetworkMetrics = NoopMetrics(),
+        cache: NetifyCachePolicy = .none,
+        responseCache: ResponseCache? = nil,
+        sensitiveHeaderKeys: Set<String>? = nil,
+        plugins: [NetifyPlugin] = []
     ) {
         // baseURL의 마지막 '/' 문자 제거
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
@@ -97,6 +107,11 @@ public struct NetifyConfiguration: Sendable {
         self.timeoutInterval = timeoutInterval
         self.authenticationProvider = authenticationProvider
         self.waitsForConnectivity = waitsForConnectivity
+        self.metrics = metrics
+        self.cache = cache
+        self.responseCache = responseCache
+        self.sensitiveHeaderKeys = sensitiveHeaderKeys ?? NetifyInternalConstants.sensitiveHeaderKeys
+        self.plugins = plugins
         
         // sessionConfiguration에 waitsForConnectivity 명시적 적용
         self.sessionConfiguration.waitsForConnectivity = waitsForConnectivity
@@ -208,6 +223,7 @@ public protocol NetifyLogging {
 public struct DefaultNetifyLogger: NetifyLogging {
     public let logLevel: NetworkingLogLevel
     private let logger: Logger // os.Logger 인스턴스
+    private let sensitiveHeaderKeys: Set<String>
     
     /// `DefaultNetifyLogger`를 초기화합니다.
     /// - Parameters:
@@ -217,10 +233,12 @@ public struct DefaultNetifyLogger: NetifyLogging {
     public init(
         logLevel: NetworkingLogLevel,
         subsystem: String = Bundle.main.bundleIdentifier ?? "com.unknown.netify", // 기본 서브시스템 개선
-        category: String = "Netify"
+        category: String = "Netify",
+        sensitiveHeaderKeys: Set<String>? = nil
     ) {
         self.logLevel = logLevel
         self.logger = Logger(subsystem: subsystem, category: category)
+        self.sensitiveHeaderKeys = sensitiveHeaderKeys ?? NetifyInternalConstants.sensitiveHeaderKeys
     }
     
     public func log(message: String, level: OSLogType = .debug) {
@@ -243,7 +261,7 @@ public struct DefaultNetifyLogger: NetifyLogging {
             } else if request.httpBodyStream != nil {
                 logMessage += "\n    Body: InputStream data (length unknown)" // 스트림은 길이 알 수 없음 명시
             }
-            logMessage += "\n    cURL: \(request.toCurlCommand())"
+            logMessage += "\n    cURL: \(request.toCurlCommand(masking: sensitiveHeaderKeys))"
         }
         logger.log(level: level, "\(logMessage)")
     }
@@ -257,7 +275,12 @@ public struct DefaultNetifyLogger: NetifyLogging {
             logMessage += " \(statusIcon) Status \(httpResponse.statusCode) from \(response.url?.absoluteString ?? "UNKNOWN_URL")"
             
             if self.logLevel >= .debug {
-                if let headers = httpResponse.allHeaderFields as? HTTPHeaders, !headers.isEmpty { // 모든 헤더 필드를 HTTPHeaders로 캐스팅
+                // 헤더를 [String: String]으로 안전 변환
+                let headers: HTTPHeaders = httpResponse.allHeaderFields.reduce(into: [:]) {
+                    dict, kv in
+                    dict[String(describing: kv.key)] = String(describing: kv.value)
+                }
+                if !headers.isEmpty {
                     logMessage += "\n    Headers: \(maskSensitiveHeaders(headers))"
                 }
                 if let data = data, !data.isEmpty {
@@ -293,24 +316,20 @@ public struct DefaultNetifyLogger: NetifyLogging {
     }
     
     /// 지정된 `OSLogType`에 대해 로깅을 수행해야 하는지 여부를 결정합니다.
+    /// OSLogType의 rawValue에 의존하지 않고, Netify의 로깅 레벨 의미론으로 게이팅합니다.
     private func shouldLog(for targetLevel: OSLogType) -> Bool {
-        guard self.logLevel != .off else { return false } // 로깅 꺼져있으면 항상 false
-        
-        let currentOsLogEquivalent: OSLogType
         switch self.logLevel {
-        case .error: currentOsLogEquivalent = .error
-        case .info: currentOsLogEquivalent = .info
-        case .debug: currentOsLogEquivalent = .debug
-        default: return false // .off는 위에서 처리
+        case .off:   return false
+        case .error: return targetLevel == .fault || targetLevel == .error
+        case .info:  return targetLevel == .fault || targetLevel == .error || targetLevel == .info
+        case .debug: return true
         }
-        // targetLevel이 현재 설정된 로그 레벨보다 같거나 중요할 때만 로깅 (숫자가 클수록 덜 중요)
-        return targetLevel.rawValue <= currentOsLogEquivalent.rawValue
     }
     
     /// 민감한 정보를 마스킹 처리한 헤더를 반환합니다.
     private func maskSensitiveHeaders(_ headers: HTTPHeaders) -> HTTPHeaders {
         var maskedHeaders = headers
-        for (key, _) in headers where NetifyInternalConstants.sensitiveHeaderKeys.contains(key.lowercased()) {
+        for (key, _) in headers where sensitiveHeaderKeys.contains(key.lowercased()) {
             maskedHeaders[key] = "<masked>"
         }
         return maskedHeaders
@@ -346,9 +365,9 @@ public enum NetworkRequestError: LocalizedError, Equatable {
     /// 404 Not Found. 연관값으로 응답 데이터(옵셔널 `Data`)를 가집니다.
     case notFound(data: Data?)
     /// 400번대 기타 클라이언트 에러. 연관값으로 상태 코드(Int)와 응답 데이터(옵셔널 `Data`)를 가집니다.
-    case clientError(statusCode: Int, data: Data?)
+    case clientError(statusCode: Int, data: Data?, retryAfter: TimeInterval?)
     /// 500번대 서버 에러. 연관값으로 상태 코드(Int)와 응답 데이터(옵셔널 `Data`)를 가집니다.
-    case serverError(statusCode: Int, data: Data?)
+    case serverError(statusCode: Int, data: Data?, retryAfter: TimeInterval?)
     /// 응답 데이터 디코딩 실패. 연관값으로 원본 디코딩 에러(`Error`)와 디코딩 시도된 데이터(옵셔널 `Data`)를 가집니다.
     case decodingError(underlyingError: Error, data: Data?)
     /// 요청 본문 인코딩 실패. 연관값으로 원본 인코딩 에러(`Error`)를 가집니다.
@@ -372,8 +391,8 @@ public enum NetworkRequestError: LocalizedError, Equatable {
         case .unauthorized: return "인증 실패 (401)"
         case .forbidden: return "접근 금지 (403)"
         case .notFound: return "찾을 수 없음 (404)"
-        case .clientError(let code, _): return "클라이언트 에러 (\(code))"
-        case .serverError(let code, _): return "서버 에러 (\(code))"
+        case .clientError(let code, _, _): return "클라이언트 에러 (\(code))"
+        case .serverError(let code, _, _): return "서버 에러 (\(code))"
         case .decodingError(let error, _): return "디코딩 에러: \(error.localizedDescription)"
         case .encodingError(let error): return "인코딩 에러: \(error.localizedDescription)"
         case .urlSessionFailed(let error): return "URLSession 실패: \(error.localizedDescription)"
@@ -390,7 +409,7 @@ public enum NetworkRequestError: LocalizedError, Equatable {
         case .invalidRequest(let reason): desc += "\n  사유: \(reason)"
         case .invalidResponse(let resp): desc += "\n  응답 객체: \(String(describing: resp))"
         case .badRequest(let d), .unauthorized(let d), .forbidden(let d), .notFound(let d),
-                .clientError(_, let d), .serverError(_, let d):
+                .clientError(_, let d, _), .serverError(_, let d, _):
             if let data = d, !data.isEmpty { desc += formatDataForDebug(data) }
             else { desc += "\n  응답 데이터: 없음" }
         case .decodingError(let err, let d):
@@ -423,6 +442,7 @@ public enum NetworkRequestError: LocalizedError, Equatable {
     public var isRetryable: Bool {
         switch self {
         case .serverError: return true // 5xx 서버 에러는 종종 일시적임
+        case .clientError(let code, _, _): return code == 429
         case .timedOut: return true
         case .noInternetConnection: return true // 연결 복구 시 재시도 가능
         case .urlSessionFailed(let error):
@@ -449,8 +469,8 @@ public enum NetworkRequestError: LocalizedError, Equatable {
         case (.unauthorized, .unauthorized): return true
         case (.forbidden, .forbidden): return true
         case (.notFound, .notFound): return true
-        case (.clientError(let lc, _), .clientError(let rc, _)): return lc == rc // 데이터 없이 코드만 비교
-        case (.serverError(let lc, _), .serverError(let rc, _)): return lc == rc // 데이터 없이 코드만 비교
+        case (.clientError(let lc, _, _), .clientError(let rc, _, _)): return lc == rc // 코드만 비교
+        case (.serverError(let lc, _, _), .serverError(let rc, _, _)): return lc == rc // 코드만 비교
         case (.decodingError(let lhsError, _), .decodingError(let rhsError, _)):
             let lns = lhsError as NSError
             let rns = rhsError as NSError
@@ -465,8 +485,10 @@ public enum NetworkRequestError: LocalizedError, Equatable {
             return lns.domain == rns.domain && lns.code == rns.code
         case (.unknownError(let le), .unknownError(let re)):
             if le == nil && re == nil { return true }
-            if let lerr = le as NSError?, let rerr = re as NSError? {
-                return lerr.domain == rerr.domain && lerr.code == rerr.code
+            if let le, let re {
+                let lns = le as NSError
+                let rns = re as NSError
+                return lns.domain == rns.domain && lns.code == rns.code
             }
             return false
         case (.cancelled, .cancelled): return true
@@ -495,12 +517,8 @@ public protocol NetifyRequest {
     var contentType: HTTPContentType { get }
     /// URL 쿼리 파라미터 (예: `["page": "1", "limit": "20"]`).
     var queryParams: QueryParameters? { get }
-    /// 요청 본문.
-    /// - JSON: `Encodable` 객체.
-    /// - URL Encoded: `[String: String]` (QueryParameters).
-    /// - Plain Text/XML: `String`.
-    /// - Data: `Data` (이 경우 `contentType`을 명시적으로 설정해야 함).
-    var body: Any? { get }
+    /// 선언적·타입세이프 본문 (권장)
+    var requestBody: RequestBody? { get }
     /// 커스텀 HTTP 헤더. 클라이언트 기본 헤더에 병합되며, 중복 시 이 헤더가 우선합니다.
     var headers: HTTPHeaders? { get }
     /// 멀티파트 요청 데이터. `body`와 함께 사용될 수 없으며, `multipartData`가 있으면 `body`는 무시됩니다.
@@ -523,7 +541,7 @@ extension NetifyRequest {
     // 프로토콜에서는 일반적인 기본값인 .json을 제공합니다.
     public var contentType: HTTPContentType { .json }
     public var queryParams: QueryParameters? { nil }
-    public var body: Any? { nil }
+    public var requestBody: RequestBody? { nil }
     public var headers: HTTPHeaders? { nil }
     public var multipartData: [MultipartData]? { nil }
     public var decoder: JSONDecoder? { nil }
@@ -532,216 +550,7 @@ extension NetifyRequest {
     public var requiresAuthentication: Bool { true } // 대부분의 요청은 인증이 필요하다고 가정
 }
 
-// MARK: - Declarative API Layer - Configuration (새로운 코드)
-@available(iOS 15, macOS 12, *)
-internal struct DeclarativeNetifyTaskConfiguration<ReturnType: Decodable> {
-    var pathTemplate: String = ""
-    var method: HTTPMethod = .get
-    var headers: HTTPHeaders = [:]
-    var queryParams: QueryParameters = [:]
-    var body: Any? = nil // Encodable, String, Data 등 다양한 타입 저장
-    var explicitContentType: HTTPContentType? = nil
-    var multipartItems: [MultipartData]? = nil
-    var customDecoder: JSONDecoder? = nil
-    var cachePolicy: URLRequest.CachePolicy? = nil
-    var timeoutInterval: TimeInterval? = nil
-    var requiresAuth: Bool = true
-    var pathArguments: [String: CustomStringConvertible] = [:]
-    
-    /// 최종적으로 사용할 ContentType을 결정합니다.
-    func resolveContentType() -> HTTPContentType {
-        if let explicit = explicitContentType { // 1. 명시적 ContentType 최우선
-            return explicit
-        }
-        if multipartItems != nil && !multipartItems!.isEmpty { // 2. 멀티파트 데이터가 있으면 .multipart
-            return .multipart
-        }
-        if let body = body { // 3. body가 있으면 추론 시도
-            if body is Data { // Data 타입이면 명시적 설정이 필요했어야 함, 없으면 octet-stream 가정
-                return .octetStream // 또는 에러 처리. 여기서는 기본값 제공.
-            }
-            // Encodable, String 등은 .json, .plainText 등으로 .body() modifier에서 설정됨
-            // 여기서 contentType이 결정 안되면 프로토콜 기본값(.json) 사용
-            return .json // 기본 추론 (JSON)
-        }
-        // body가 없고 명시적 타입도 없으면 프로토콜 기본값(.json) 따름 (주로 GET 요청)
-        return .json
-    }
-}
 
-// MARK: - Declarative API Layer - Task Builder (새로운 코드)
-/// 선언적 방식으로 네트워크 요청을 구성하는 빌더입니다.
-/// 이 빌더를 통해 생성된 작업은 `NetifyRequest` 프로토콜을 준수합니다.
-@available(iOS 15, macOS 12, *)
-public struct DeclarativeNetifyTask<ReturnType: Decodable> {
-    private var configuration: DeclarativeNetifyTaskConfiguration<ReturnType>
-    
-    private init() {
-        self.configuration = DeclarativeNetifyTaskConfiguration<ReturnType>()
-    }
-    
-    /// 내부적으로 빌더 인스턴스를 생성합니다. `Netify.task()`를 통해 사용하세요.
-    internal static func new() -> DeclarativeNetifyTask<ReturnType> {
-        DeclarativeNetifyTask<ReturnType>()
-    }
-    
-    // --- Modifier Methods ---
-    
-    /// 요청의 HTTP 메소드를 설정합니다.
-    public func method(_ method: HTTPMethod) -> Self {
-        var newRequest = self; newRequest.configuration.method = method; return newRequest
-    }
-    
-    /// 요청 경로 템플릿을 설정합니다. (예: "/users/{id}")
-    public func path(_ pathTemplate: String) -> Self {
-        var newRequest = self; newRequest.configuration.pathTemplate = pathTemplate; return newRequest
-    }
-    
-    /// 경로 템플릿 내의 특정 인자 값을 설정합니다.
-    public func pathArgument(_ key: String, _ value: CustomStringConvertible) -> Self {
-        var newRequest = self; newRequest.configuration.pathArguments[key] = value; return newRequest
-    }
-    
-    /// 여러 경로 인자들을 한 번에 설정합니다.
-    public func pathArguments(_ args: [String: CustomStringConvertible]) -> Self {
-        var newRequest = self; newRequest.configuration.pathArguments.merge(args) { (_, new) in new }; return newRequest
-    }
-    
-    /// 요청에 커스텀 HTTP 헤더를 추가합니다.
-    public func header(_ name: String, _ value: String) -> Self {
-        var newRequest = self; newRequest.configuration.headers[name] = value; return newRequest
-    }
-    
-    /// 여러 커스텀 HTTP 헤더를 한 번에 설정합니다.
-    public func headers(_ headersToAdd: HTTPHeaders) -> Self {
-        var newRequest = self; newRequest.configuration.headers.merge(headersToAdd) { (_, new) in new }; return newRequest
-    }
-    
-    /// 요청 URL에 쿼리 파라미터를 추가합니다. 값이 `nil`이면 추가하지 않습니다.
-    public func queryParam(_ name: String, _ value: CustomStringConvertible?) -> Self {
-        guard let value = value else { return self }
-        var newRequest = self; newRequest.configuration.queryParams[name] = value.description; return newRequest
-    }
-    
-    /// 여러 쿼리 파라미터를 한 번에 설정합니다.
-    public func queryParams(_ paramsToAdd: QueryParameters) -> Self {
-        var newRequest = self; newRequest.configuration.queryParams.merge(paramsToAdd) { (_, new) in new }; return newRequest
-    }
-    
-    /// `Encodable` 객체를 요청 본문으로 설정합니다. 기본 Content-Type은 `.json`입니다.
-    public func body<B: Encodable>(_ encodableBody: B, contentType: HTTPContentType = .json) -> Self {
-        var newRequest = self
-        newRequest.configuration.body = encodableBody
-        newRequest.configuration.explicitContentType = contentType
-        newRequest.configuration.multipartItems = nil
-        return newRequest
-    }
-    
-    /// 문자열을 요청 본문으로 설정합니다. 기본 Content-Type은 `.plainText`입니다.
-    public func body(_ stringBody: String, contentType: HTTPContentType = .plainText) -> Self {
-        var newRequest = self
-        newRequest.configuration.body = stringBody
-        newRequest.configuration.explicitContentType = contentType
-        newRequest.configuration.multipartItems = nil
-        return newRequest
-    }
-    
-    /// `Data`를 요청 본문으로 설정합니다. `contentType`을 명시적으로 지정해야 합니다.
-    public func body(_ data: Data, contentType: HTTPContentType) -> Self {
-        var newRequest = self
-        newRequest.configuration.body = data
-        newRequest.configuration.explicitContentType = contentType
-        newRequest.configuration.multipartItems = nil
-        return newRequest
-    }
-    
-    /// 멀티파트 데이터를 요청 본문으로 설정합니다. Content-Type은 자동으로 `.multipart`로 설정됩니다.
-    public func multipart(_ parts: [MultipartData]) -> Self {
-        var newRequest = self
-        newRequest.configuration.multipartItems = parts.isEmpty ? nil : parts // 빈 배열이면 nil로 설정
-        newRequest.configuration.explicitContentType = .multipart
-        newRequest.configuration.body = nil
-        return newRequest
-    }
-    
-    /// 요청의 `Content-Type`을 명시적으로 설정합니다.
-    public func contentType(_ type: HTTPContentType) -> Self {
-        var newRequest = self; newRequest.configuration.explicitContentType = type; return newRequest
-    }
-    
-    /// 이 요청에 사용할 커스텀 `JSONDecoder`를 지정합니다.
-    public func customDecoder(_ decoder: JSONDecoder) -> Self {
-        var newRequest = self; newRequest.configuration.customDecoder = decoder; return newRequest
-    }
-    
-    /// 이 요청의 `URLRequest.CachePolicy`를 설정합니다.
-    public func cachePolicy(_ policy: URLRequest.CachePolicy) -> Self {
-        var newRequest = self; newRequest.configuration.cachePolicy = policy; return newRequest
-    }
-    
-    /// 이 요청의 타임아웃 간격(초)을 설정합니다.
-    public func timeout(_ interval: TimeInterval) -> Self {
-        var newRequest = self; newRequest.configuration.timeoutInterval = interval; return newRequest
-    }
-    
-    /// 이 요청이 인증을 필요로 하는지 여부를 지정합니다.
-    public func authentication(required: Bool) -> Self {
-        var newRequest = self; newRequest.configuration.requiresAuth = required; return newRequest
-    }
-}
-
-// MARK: - Declarative API Layer - NetifyRequest Conformance (새로운 코드)
-@available(iOS 15, macOS 12, *)
-extension DeclarativeNetifyTask: NetifyRequest {
-    // ReturnType은 이미 구조체의 제네릭 파라미터로 정의됨
-    
-    public var path: String {
-        configuration.pathArguments.reduce(configuration.pathTemplate) { currentPath, argument in
-            currentPath.replacingOccurrences(of: "{\(argument.key)}", with: argument.value.description)
-        }
-    }
-    public var method: HTTPMethod { configuration.method }
-    public var contentType: HTTPContentType { configuration.resolveContentType() }
-    public var queryParams: QueryParameters? { configuration.queryParams.isEmpty ? nil : configuration.queryParams }
-    public var body: Any? { configuration.body }
-    public var headers: HTTPHeaders? { configuration.headers.isEmpty ? nil : configuration.headers }
-    public var multipartData: [MultipartData]? { configuration.multipartItems }
-    public var decoder: JSONDecoder? { configuration.customDecoder }
-    public var cachePolicy: URLRequest.CachePolicy? { configuration.cachePolicy }
-    public var timeoutInterval: TimeInterval? { configuration.timeoutInterval }
-    public var requiresAuthentication: Bool { configuration.requiresAuth }
-}
-
-// MARK: - Declarative API Layer - Entry Point (새로운 코드)
-/// Netify의 선언적 API 진입점을 제공하는 네임스페이스입니다.
-@available(iOS 15, macOS 12, *)
-public enum Netify {
-    /// 특정 `Decodable` 응답 타입을 기대하는 선언적 네트워크 작업을 빌드하기 시작합니다.
-    public static func task<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new()
-    }
-    
-    /// 선언적 GET 네트워크 작업을 빌드하기 시작합니다.
-    public static func get<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new().method(.get)
-    }
-    /// 선언적 POST 네트워크 작업을 빌드하기 시작합니다.
-    public static func post<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new().method(.post)
-    }
-    /// 선언적 PUT 네트워크 작업을 빌드하기 시작합니다.
-    public static func put<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new().method(.put)
-    }
-    /// 선언적 DELETE 네트워크 작업을 빌드하기 시작합니다.
-    public static func delete<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new().method(.delete)
-    }
-    /// 선언적 PATCH 네트워크 작업을 빌드하기 시작합니다.
-    public static func patch<R: Decodable>(expecting responseType: R.Type = R.self) -> DeclarativeNetifyTask<R> {
-        return DeclarativeNetifyTask<R>.new().method(.patch)
-    }
-}
 
 // MARK: - Authentication Provider Protocol & Implementations
 
@@ -911,30 +720,11 @@ public struct URLPathBuilder {
     /// 기본 URL 문자열과 경로 문자열을 결합하여 URL 객체를 생성합니다.
     /// 기본 URL과 경로 사이의 슬래시(/)를 적절히 처리합니다.
     public static func buildURL(baseURL: String, path: String) throws -> URL {
-        guard var components = URLComponents(string: baseURL) else {
+        guard let base = URL(string: baseURL) else {
             throw NetworkRequestError.invalidRequest(reason: "잘못된 기본 URL 문자열입니다: \(baseURL)")
         }
-        
-        let basePath = components.path // 기본 URL 자체의 경로 부분
-        let pathToAppend = path.starts(with: "/") ? String(path.dropFirst()) : path // 추가할 경로의 첫 슬래시 제거
-        
-        // 기본 경로가 비어있거나 슬래시로 끝나면 바로 연결, 아니면 슬래시 추가 후 연결
-        if basePath.isEmpty || basePath.hasSuffix("/") {
-            components.path = basePath + pathToAppend
-        } else {
-            components.path = basePath + "/" + pathToAppend
-        }
-        
-        // 경로 정규화: 중복 슬래시 제거 (예: /api//v1/users -> /api/v1/users)
-        // URLComponents.path는 자동으로 선행 슬래시를 관리하므로, 수동으로 추가/제거할 필요가 줄어듭니다.
-        // 하지만, 여기서 명시적으로 한번 더 정제하여 일관성을 높입니다.
-        let normalizedPath = components.path.split(separator: "/", omittingEmptySubsequences: true).joined(separator: "/")
-        components.path = normalizedPath.isEmpty ? "/" : "/" + normalizedPath // 비어있지 않으면 항상 슬래시로 시작
-        
-        guard let url = components.url else {
-            throw NetworkRequestError.invalidRequest(reason: "최종 URL 생성 실패: baseURL '\(baseURL)', path '\(path)'")
-        }
-        return url
+        let append = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        return base.appendingPathComponent(append)
     }
 }
 
@@ -987,8 +777,9 @@ internal extension NSMutableData {
 extension URLRequest {
     /// 디버깅을 위해 `URLRequest`의 cURL 명령어 문자열 표현을 생성합니다.
     /// 민감한 헤더(Authorization, Cookie 등)는 마스킹 처리됩니다.
-    public func toCurlCommand() -> String {
+    public func toCurlCommand(masking sensitive: Set<String>? = nil) -> String {
         guard let url = self.url else { return "# Netify: cURL 명령어 생성 실패 (유효하지 않은 URL)" }
+        let mask = sensitive ?? NetifyInternalConstants.sensitiveHeaderKeys
         var command = [#"curl -v "\#(url.absoluteString)""#] // -v 옵션으로 상세 출력
         
         // HTTP 메소드 추가 (GET이 아니면)
@@ -998,7 +789,7 @@ extension URLRequest {
         
         // 헤더 추가 (민감 정보 마스킹)
         self.allHTTPHeaderFields?.sorted(by: { $0.key < $1.key }).forEach { key, value in
-            let displayValue = NetifyInternalConstants.sensitiveHeaderKeys.contains(key.lowercased()) ? "<masked>" : value
+            let displayValue = mask.contains(key.lowercased()) ? "<masked>" : value
             let escapedValue = displayValue.replacingOccurrences(of: "'", with: #"\'"#) // 작은 따옴표 이스케이프
             command.append("-H '\(key): \(escapedValue)'")
         }
@@ -1031,6 +822,7 @@ public final class NetifyClient: NetifyClientProtocol {
     private let networkSession: NetworkSessionProtocol // URLSession 대신 프로토콜 사용
     private let logger: NetifyLogging
     private let requestBuilder: RequestBuilder // 내부 RequestBuilder 사용
+    private let varyIndex = VaryIndex()
     
     /// Netify 클라이언트를 초기화합니다.
     /// - Parameters:
@@ -1044,7 +836,7 @@ public final class NetifyClient: NetifyClientProtocol {
     ) {
         self.configuration = configuration
         self.networkSession = networkSession ?? URLSession(configuration: configuration.sessionConfiguration)
-        self.logger = logger ?? DefaultNetifyLogger(logLevel: configuration.logLevel) // 주입받거나 기본 로거 사용
+        self.logger = logger ?? DefaultNetifyLogger(logLevel: configuration.logLevel, sensitiveHeaderKeys: configuration.sensitiveHeaderKeys) // 주입받거나 기본 로거 사용
         self.requestBuilder = RequestBuilder(configuration: configuration, logger: self.logger) // 빌더에 로거 전달
         
         self.logger.log(message: "NetifyClient 초기화 완료. BaseURL: \(configuration.baseURL), LogLevel: \(configuration.logLevel)", level: .info)
@@ -1053,99 +845,239 @@ public final class NetifyClient: NetifyClientProtocol {
     /// 특정 `NetifyRequest`를 비동기적으로 보내고 응답을 처리합니다.
     /// 재시도 및 인증 토큰 갱신 로직을 포함합니다.
     public func send<Request: NetifyRequest>(_ request: Request) async throws -> Request.ReturnType {
-        try await sendRequestWithRetry(request, currentRetryCount: 0)
+        try await sendRequestWithRetry(request, currentRetryCount: 0, authRetryCount: 0)
     }
     
     /// 재시도 및 인증 갱신 로직을 포함하여 요청을 처리하는 내부 메소드입니다.
-    private func sendRequestWithRetry<Request: NetifyRequest>(_ request: Request, currentRetryCount: Int) async throws -> Request.ReturnType {
-        var urlRequest: URLRequest
-        do {
-            urlRequest = try await requestBuilder.buildURLRequest(from: request)
-            logger.log(request: urlRequest, level: .debug)
-        } catch {
-            let netifyError = mapToNetifyError(error) // 에러 매핑
-            logger.log(error: netifyError, level: .error)
-            throw netifyError
+    private func sendRequestWithRetry<Request: NetifyRequest>(
+        _ request: Request, currentRetryCount: Int, authRetryCount: Int
+    ) async throws -> Request.ReturnType {
+        let attemptStarted = Date()
+        var urlRequest: URLRequest = try await buildAndLogRequest(from: request)
+        
+        // ---- Simple Cache (GET만 기본 대상) ----
+        let useCache = configuration.responseCache != nil && request.method == .get
+        let baseKeyAndEffective: (base: String, key: String)? = {
+            guard useCache, let url = urlRequest.url else { return nil }
+            let base = CacheKey.make(method: request.method.rawValue, url: url)
+            return (base, base)
+        }()
+        var cacheKey: String? = baseKeyAndEffective?.key
+        if let pair = baseKeyAndEffective {
+            let names = await varyIndex.get(for: pair.base)
+            if let url = urlRequest.url, !names.isEmpty {
+                let varyParts: [String] = names.map { name in
+                    let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
+                    return "\(name)=\(v)"
+                }
+                cacheKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
+            }
+        }
+        var cached: (status: Int, headers: HTTPHeaders, data: Data, storedAt: Date)?
+        if let key = cacheKey, useCache {
+            if let cache = configuration.responseCache {
+                cached = await cache.read(key: key)
+            }
+            if let cached, case .ttl(let seconds) = configuration.cache {
+                if Date().timeIntervalSince(cached.storedAt) < seconds {
+                    logger.log(message: "TTL cache hit for \(key)", level: .info)
+                    let result = try self.decodeSuccess(data: cached.data, for: request)
+                    if let url = urlRequest.url,
+                       let resp = HTTPURLResponse(url: url, statusCode: cached.status, httpVersion: nil, headerFields: cached.headers) {
+                        configuration.plugins.forEach { $0.didReceive(.success((cached.data, resp)), for: urlRequest) }
+                    }
+                    configuration.metrics.recordRequest(
+                        path: request.path, method: request.method.rawValue,
+                        duration: Date().timeIntervalSince(attemptStarted),
+                        status: 200, retryCount: currentRetryCount
+                    )
+                    return result
+                }
+            }
+            if let cached, case .etag = configuration.cache {
+                if let etag = cached.headers["etag"] {
+                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
+                    hdrs["If-None-Match"] = etag
+                    urlRequest.allHTTPHeaderFields = hdrs
+                }
+            }
+            if let cached, case .etagOrTtl(let seconds) = configuration.cache {
+                if Date().timeIntervalSince(cached.storedAt) < seconds {
+                    logger.log(message: "TTL(etagOrTtl) cache hit for \(key)", level: .info)
+                    let result = try self.decodeSuccess(data: cached.data, for: request)
+                    if let url = urlRequest.url,
+                       let resp = HTTPURLResponse(url: url, statusCode: cached.status, httpVersion: nil, headerFields: cached.headers) {
+                        configuration.plugins.forEach { $0.didReceive(.success((cached.data, resp)), for: urlRequest) }
+                    }
+                    configuration.metrics.recordRequest(
+                        path: request.path, method: request.method.rawValue,
+                        duration: Date().timeIntervalSince(attemptStarted),
+                        status: 200, retryCount: currentRetryCount
+                    )
+                    return result
+                }
+                if let etag = cached.headers["etag"] {
+                    var hdrs = urlRequest.allHTTPHeaderFields ?? [:]
+                    hdrs["If-None-Match"] = etag
+                    urlRequest.allHTTPHeaderFields = hdrs
+                }
+            }
         }
         
+        // Plugins: willSend
+        configuration.plugins.forEach { $0.willSend(urlRequest) }
         do {
             let (data, response) = try await performDataTask(for: urlRequest)
-            logger.log(response: response, data: data, level: .debug) // 응답 로깅
-            return try handleResponse(response: response, data: data, for: request) // 요청 정보 전달
+            logger.log(response: response, data: data, level: .debug)
+            
+            if let http = response as? HTTPURLResponse,
+               http.statusCode == 304,
+               let key = cacheKey, let hit = cached {
+                logger.log(message: "ETag 304 -> cache return for \(key)", level: .info)
+                let result = try self.decodeSuccess(data: hit.data, for: request)
+                configuration.plugins.forEach { $0.didReceive(.success((hit.data, response)), for: urlRequest) }
+                configuration.metrics.recordRequest(
+                    path: request.path, method: request.method.rawValue,
+                    duration: Date().timeIntervalSince(attemptStarted),
+                    status: 304, retryCount: currentRetryCount
+                )
+                return result
+            }
+            
+            let value: Request.ReturnType = try handleResponse(response: response, data: data, for: request)
+            configuration.plugins.forEach { $0.didReceive(.success((data, response)), for: urlRequest) }
+            if let http = response as? HTTPURLResponse {
+                configuration.metrics.recordRequest(
+                    path: request.path, method: request.method.rawValue,
+                    duration: Date().timeIntervalSince(attemptStarted),
+                    status: http.statusCode, retryCount: currentRetryCount
+                )
+            } else {
+                configuration.metrics.recordRequest(
+                    path: request.path, method: request.method.rawValue,
+                    duration: Date().timeIntervalSince(attemptStarted),
+                    status: nil, retryCount: currentRetryCount
+                )
+            }
+            
+            if let http = response as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let key = cacheKey, useCache, let cache = configuration.responseCache {
+                let headers: HTTPHeaders = requestBuilder.normalizedHeaders(http)
+                var writeKey = key
+                if let base = baseKeyAndEffective?.base,
+                   let varyValue = headers["vary"], !varyValue.isEmpty,
+                   let url = urlRequest.url {
+                    let names = varyValue
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                        .filter { !$0.isEmpty }
+                    if !names.isEmpty {
+                        await varyIndex.set(names, for: base)
+                        let varyParts: [String] = names.map { name in
+                            let v = urlRequest.value(forHTTPHeaderField: name) ?? ""
+                            return "\(name)=\(v)"
+                        }
+                        writeKey = CacheKey.make(method: request.method.rawValue, url: url, varyHeaders: varyParts)
+                    }
+                }
+                switch configuration.cache {
+                case .none: break
+                case .ttl, .etag, .etagOrTtl:
+                    await cache.write(key: writeKey, status: http.statusCode, headers: headers, data: data, storedAt: Date())
+                }
+            }
+            return value
         } catch let error {
             let netifyError = mapToNetifyError(error)
             logger.log(error: netifyError, level: .error)
+            configuration.plugins.forEach { $0.didReceive(.failure(netifyError), for: urlRequest) }
             
-            // 인증 실패 처리
             if request.requiresAuthentication,
                let authProvider = configuration.authenticationProvider,
                authProvider.isAuthenticationExpired(from: netifyError) {
-                
+                guard authRetryCount < 1 else { throw netifyError }
                 logger.log(message: "인증 만료 감지. 토큰 갱신 시도...", level: .info)
                 let refreshSuccess = await attemptAuthRefresh(using: authProvider)
                 
                 if refreshSuccess {
                     logger.log(message: "인증 토큰 갱신 성공. 원본 요청 재시도...", level: .info)
-                    // 인증 성공 시 재시도 횟수 증가 없이 즉시 재시도
-                    return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount)
+                    return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount, authRetryCount: authRetryCount + 1)
                 } else {
                     logger.log(message: "인증 토큰 갱신 실패 또는 미지원. 원본 에러(\(netifyError.localizedDescription)) 발생.", level: .error)
-                    throw netifyError // 갱신 실패 시 원본 에러 (예: .unauthorized) 발생
+                    throw netifyError
                 }
             }
             
-            // 일반 재시도 처리
             if netifyError.isRetryable && currentRetryCount < configuration.maxRetryCount {
-                logger.log(message: "재시도 가능 에러 발생. 재시도 (\(currentRetryCount + 1)/\(configuration.maxRetryCount)). 에러: \(netifyError.localizedDescription)", level: .info)
-                try? await Task.sleep(nanoseconds: NetifyInternalConstants.defaultRetryDelayNanoseconds) // 재시도 전 대기
-                try Task.checkCancellation() // 작업 취소 확인
-                return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount + 1) // 재귀 호출 (재시도 횟수 증가)
+                let retryAfterSeconds: TimeInterval? = {
+                    if case let .clientError(code, _, ra) = netifyError, code == 429 { return ra }
+                    if case let .serverError(_, _, ra) = netifyError { return ra }
+                    return nil
+                }()
+                let delayNs = computeRetryDelayNanoseconds(attempt: currentRetryCount + 1, retryAfter: retryAfterSeconds)
+                logger.log(message: "재시도 가능 에러 발생. 재시도 (\(currentRetryCount + 1)/\(configuration.maxRetryCount)), 대기 (\(Double(delayNs)/1_000_000_000))s. 에러: \(netifyError.localizedDescription)", level: .info)
+                try? await Task.sleep(nanoseconds: delayNs)
+                try Task.checkCancellation()
+                return try await sendRequestWithRetry(request, currentRetryCount: currentRetryCount + 1, authRetryCount: authRetryCount)
             }
-            
-            throw netifyError // 재시도 불가 또는 최대 재시도 도달 시 최종 에러 발생
+            configuration.metrics.recordError(path: request.path, method: request.method.rawValue, error: netifyError)
+            throw netifyError
+        }
+    }
+
+    // MARK: - Small helpers (complexity reduction)
+    private func buildAndLogRequest<Request: NetifyRequest>(from request: Request) async throws -> URLRequest {
+        do {
+            let urlRequest = try await requestBuilder.buildURLRequest(from: request)
+            logger.log(request: urlRequest, level: .debug)
+            return urlRequest
+        } catch {
+            let netifyError = mapToNetifyError(error)
+            logger.log(error: netifyError, level: .error)
+            throw netifyError
         }
     }
     
-    /// `NetworkSessionProtocol`을 사용하여 실제 데이터 작업을 수행합니다.
     private func performDataTask(for request: URLRequest) async throws -> (Data, URLResponse) {
-        try await networkSession.data(for: request, delegate: nil) // URLSessionTaskDelegate는 현재 사용하지 않음
+        try await networkSession.data(for: request, delegate: nil)
     }
     
-    /// `URLResponse` 및 `Data`를 처리하고, 상태 코드를 검증하며, 데이터를 디코딩합니다.
-    /// `NetifyRequest` 정보를 사용하여 적절한 디코더를 선택합니다.
+    private func decodeSuccess<Request: NetifyRequest>(data: Data, for request: Request) throws -> Request.ReturnType {
+        if data.isEmpty {
+            if Request.ReturnType.self == EmptyResponse.self, let empty = EmptyResponse() as? Request.ReturnType {
+                return empty
+            } else if Request.ReturnType.self == Data.self, let d = data as? Request.ReturnType {
+                return d
+            } else {
+                throw NetworkRequestError.decodingError(
+                    underlyingError: NSError(domain: "Netify.Decode", code: -1, userInfo: [NSLocalizedDescriptionKey: "빈 응답 본문"]),
+                    data: data
+                )
+            }
+        } else {
+            let decoder = request.decoder ?? configuration.defaultDecoder
+            do {
+                return try decoder.decode(Request.ReturnType.self, from: data)
+            } catch {
+                throw NetworkRequestError.decodingError(underlyingError: error, data: data)
+            }
+        }
+    }
+    
     private func handleResponse<Request: NetifyRequest>(response: URLResponse, data: Data, for netifyRequest: Request) throws -> Request.ReturnType {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NetworkRequestError.invalidResponse(response: response)
         }
         
         guard (200...299).contains(httpResponse.statusCode) else {
-            throw mapStatusCodeToError(statusCode: httpResponse.statusCode, data: data)
+            let headers: HTTPHeaders = httpResponse.allHeaderFields.reduce(into: [:]) { dict, kv in
+                dict[String(describing: kv.key)] = String(describing: kv.value)
+            }
+            throw mapStatusCodeToError(statusCode: httpResponse.statusCode, data: data, headers: headers)
         }
         
-        // 성공 응답 (2xx) 처리
-        if data.isEmpty {
-            if Request.ReturnType.self == EmptyResponse.self { // 기대 타입이 EmptyResponse인 경우
-                guard let empty = EmptyResponse() as? Request.ReturnType else {
-                    // 이 캐스팅은 이론적으로 항상 성공해야 함
-                    throw NetworkRequestError.unknownError(underlyingError: NSError(domain: "Netify.HandleResponse", code: -1001, userInfo: [NSLocalizedDescriptionKey: "EmptyResponse 캐스팅 실패"]))
-                }
-                return empty
-            } else if Request.ReturnType.self == Data.self { // 기대 타입이 Data인 경우 (빈 데이터도 유효)
-                guard let emptyData = data as? Request.ReturnType else {
-                    throw NetworkRequestError.unknownError(underlyingError: NSError(domain: "Netify.HandleResponse", code: -1002, userInfo: [NSLocalizedDescriptionKey: "빈 Data 객체 캐스팅 실패"]))
-                }
-                return emptyData
-            } else { // 다른 Decodable 타입을 기대하는데 데이터가 비어있으면 에러
-                throw NetworkRequestError.decodingError(underlyingError: NSError(domain: "Netify.HandleResponse", code: -1003, userInfo: [NSLocalizedDescriptionKey: "\(Request.ReturnType.self) 타입을 기대했으나 빈 응답 본문을 받았습니다."]), data: data)
-            }
-        } else { // 데이터가 있는 경우 디코딩 시도
-            do {
-                let decoder = netifyRequest.decoder ?? configuration.defaultDecoder // 요청별 디코더 또는 클라이언트 기본 디코더 사용
-                return try decoder.decode(Request.ReturnType.self, from: data)
-            } catch let decodingError {
-                throw NetworkRequestError.decodingError(underlyingError: decodingError, data: data) // 원본 디코딩 에러 포함
-            }
-        }
+        return try decodeSuccess(data: data, for: netifyRequest)
     }
     
     /// 인증 토큰 갱신을 시도하는 헬퍼 함수입니다.
@@ -1186,16 +1118,41 @@ public final class NetifyClient: NetifyClientProtocol {
         }
     }
     
+    /// Retry-After(초) 우선, 없으면 지수(1,2,4...) + 지터(0~0.5초) 백오프
+    private func computeRetryDelayNanoseconds(attempt: Int, retryAfter: TimeInterval?) -> UInt64 {
+        if let ra = retryAfter, ra > 0 {
+            return UInt64(ra * 1_000_000_000)
+        }
+        let base = pow(2.0, Double(max(1, attempt))) // 1,2,4,...
+        let jitter = Double.random(in: 0...0.5)
+        return UInt64((base + jitter) * 1_000_000_000)
+    }
+    
     /// HTTP 상태 코드(2xx 범위 외)를 적절한 `NetworkRequestError`로 매핑합니다.
-    private func mapStatusCodeToError(statusCode: Int, data: Data?) -> NetworkRequestError {
+    private func mapStatusCodeToError(statusCode: Int, data: Data?, headers: HTTPHeaders?) -> NetworkRequestError {
+        func parseRetryAfter(_ headers: HTTPHeaders?) -> TimeInterval? {
+            guard let raw = headers?["Retry-After"] ?? headers?["retry-after"] else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let seconds = TimeInterval(trimmed) { return seconds }
+            // HTTP-date (IMF-fixdate) 형식 시도
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = TimeZone(secondsFromGMT: 0)
+            fmt.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+            if let date = fmt.date(from: trimmed) {
+                return max(0, date.timeIntervalSinceNow)
+            }
+            return nil
+        }
+        let retryAfter = parseRetryAfter(headers)
         switch statusCode {
         case 400: return .badRequest(data: data)
         case 401: return .unauthorized(data: data)
         case 403: return .forbidden(data: data)
         case 404: return .notFound(data: data)
-        case 405...499: return .clientError(statusCode: statusCode, data: data) // 기타 4xx 에러
-        case 500...599: return .serverError(statusCode: statusCode, data: data) // 모든 5xx 에러
-        default: // 예상치 못한 상태 코드 (예: 1xx, 3xx - 3xx는 URLSession에서 자동 처리되는 경우가 많음)
+        case 405...499: return .clientError(statusCode: statusCode, data: data, retryAfter: retryAfter) // 기타 4xx
+        case 500...599: return .serverError(statusCode: statusCode, data: data, retryAfter: retryAfter) // 5xx
+        default: // 예상치 못한 상태 코드
             logger.log(message: "처리되지 않은 HTTP 상태 코드 수신: \(statusCode)", level: .info)
             return .unknownError(underlyingError: NSError(domain: "Netify.StatusCodeMapping", code: statusCode, userInfo: [NSLocalizedDescriptionKey: "처리되지 않은 HTTP 상태 코드: \(statusCode)"]))
         }
@@ -1211,42 +1168,38 @@ internal struct RequestBuilder {
     let configuration: NetifyConfiguration
     let logger: NetifyLogging
     
-    /// `NetifyRequest`로부터 `URLRequest`를 빌드합니다.
-    /// URL 구성, 쿼리 파라미터, 헤더, 본문 인코딩, 인증 처리를 담당합니다.
+    /// `NetifyRequest`로부터 `URLRequest`를 빌드합니다. (내부 서브 스텝으로 분리)
     func buildURLRequest<Request: NetifyRequest>(from netifyRequest: Request) async throws -> URLRequest {
-        // 1. 최종 URL 구성 (경로 + 쿼리 파라미터)
+        // 1) URL 구성
         let url = try buildFinalURL(for: netifyRequest)
+        // 2) 베이스 요청 + 헤더 병합
+        var urlRequest = makeBaseURLRequest(url: url, request: netifyRequest)
+        var headers = makeMergedHeaders(for: netifyRequest)
         
-        // 2. URLRequest 초기화 및 기본 속성 설정
-        var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = netifyRequest.method.rawValue
-        urlRequest.timeoutInterval = netifyRequest.timeoutInterval ?? configuration.timeoutInterval // 요청별 설정 우선
-        urlRequest.cachePolicy = netifyRequest.cachePolicy ?? configuration.cachePolicy // 요청별 설정 우선
-        
-        // 3. 헤더 준비 (클라이언트 기본 헤더 + 요청별 헤더)
-        var headers = configuration.defaultHeaders // 기본 헤더로 시작
-        netifyRequest.headers?.forEach { headers[$0.key] = $0.value } // 요청별 헤더가 기본 헤더 덮어씀
+        // 기본 Accept 헤더 설정 (요청자가 지정하지 않은 경우)
+        if headers[HTTPHeaderField.acceptType.rawValue] == nil {
+            if Request.ReturnType.self == Data.self || Request.ReturnType.self == EmptyResponse.self {
+                headers[HTTPHeaderField.acceptType.rawValue] = "*/*"
+            } else {
+                headers[HTTPHeaderField.acceptType.rawValue] = HTTPContentType.json.rawValue
+            }
+        }
         
         // 4. 본문 및 Content-Type 헤더 준비
         let boundary = "Boundary-\(UUID().uuidString)" // 멀티파트용 경계 문자열
         
         if let multipartItems = netifyRequest.multipartData, !multipartItems.isEmpty {
             // 멀티파트 데이터 처리
-            if netifyRequest.body != nil { // body와 multipartData 동시 제공 경고
-                logger.log(message: "경고: 'body'와 'multipartData'가 동시에 제공되었습니다. 'body'는 무시됩니다. (경로: \(netifyRequest.path))", level: .info) // .error 대신 .info 또는 .debug
-            }
             headers[HTTPHeaderField.contentType.rawValue] = "\(HTTPContentType.multipart.rawValue); boundary=\(boundary)"
             urlRequest.httpBody = buildMultipartBody(parts: multipartItems, boundary: boundary)
-        } else if let bodyObject = netifyRequest.body {
-            // 일반 본문 처리 (NetifyRequest의 contentType 사용)
-            try encodeAndSetBody(&urlRequest, body: bodyObject, contentType: netifyRequest.contentType, headers: &headers)
+        } else if let rb = netifyRequest.requestBody {
+            // 타입세이프 RequestBody 우선
+            try encodeAndSetRequestBody(&urlRequest, requestBody: rb, headers: &headers)
         }
         // body가 nil이면 아무것도 하지 않음 (예: GET 요청)
         
         // 5. 최종 헤더 설정
-        if !headers.isEmpty {
-            urlRequest.allHTTPHeaderFields = headers
-        }
+        if !headers.isEmpty { urlRequest.allHTTPHeaderFields = headers }
         
         // 6. 인증 처리 (모든 헤더와 본문 설정 후 마지막에 적용)
         if netifyRequest.requiresAuthentication, let authProvider = configuration.authenticationProvider {
@@ -1258,11 +1211,29 @@ internal struct RequestBuilder {
         }
         return urlRequest
     }
+        
+    private func makeBaseURLRequest<Request: NetifyRequest>(url: URL, request: Request) -> URLRequest {
+        var r = URLRequest(url: url)
+        r.httpMethod = request.method.rawValue
+        r.timeoutInterval = request.timeoutInterval ?? configuration.timeoutInterval
+        r.cachePolicy = request.cachePolicy ?? configuration.cachePolicy
+        return r
+    }
+
+    private func makeMergedHeaders<Request: NetifyRequest>(for request: Request) -> HTTPHeaders {
+        var h = configuration.defaultHeaders
+        request.headers?.forEach { h[$0.key] = $0.value }
+        return h
+    }
     
     /// 경로와 쿼리 파라미터를 포함한 최종 URL을 빌드하는 헬퍼 함수.
     private func buildFinalURL<Request: NetifyRequest>(for netifyRequest: Request) throws -> URL {
         let baseURL = configuration.baseURL
         let path = netifyRequest.path // NetifyRequest에서 제공된 경로 (예: /users/{id})
+        // 미치환 템플릿 가드
+        if path.contains("{") || path.contains("}") {
+            throw NetworkRequestError.invalidRequest(reason: "경로 템플릿이 완전히 치환되지 않았습니다: \(path)")
+        }
         
         // URLPathBuilder를 사용하여 baseURL과 path 결합
         let initialURL = try URLPathBuilder.buildURL(baseURL: baseURL, path: path)
@@ -1290,65 +1261,48 @@ internal struct RequestBuilder {
     
     /// ContentType에 따라 본문을 인코딩하고 요청에 설정하는 헬퍼 함수.
     /// Content-Type 헤더도 설정 (요청별 헤더에 명시적으로 없으면).
-    private func encodeAndSetBody(_ urlRequest: inout URLRequest, body: Any, contentType: HTTPContentType, headers: inout HTTPHeaders) throws {
-        do {
-            switch contentType {
-            case .json:
-                guard let encodableBody = body as? Encodable else {
-                    throw NetworkRequestError.invalidRequest(reason: "JSON Content-Type에 대해 요청 본문(\(type(of: body)))이 Encodable하지 않습니다.")
-                }
-                urlRequest.httpBody = try configuration.defaultEncoder.encode(encodableBody)
-            case .urlEncoded:
-                guard let paramsBody = body as? QueryParameters else { // [String: String] 타입이어야 함
-                    throw NetworkRequestError.invalidRequest(reason: "URL Encoded Content-Type에 대해 요청 본문(\(type(of: body)))이 [String: String]이 아닙니다.")
-                }
-                urlRequest.httpBody = paramsBody.toUrlEncodedQueryString()?.data(using: .utf8)
-            case .plainText:
-                guard let stringBody = body as? String else {
-                    throw NetworkRequestError.invalidRequest(reason: "Plain Text Content-Type에 대해 요청 본문(\(type(of: body)))이 String이 아닙니다.")
-                }
-                urlRequest.httpBody = stringBody.data(using: .utf8)
-            case .xml:
-                guard let stringBody = body as? String else { // XML도 보통 문자열로 처리
-                    throw NetworkRequestError.invalidRequest(reason: "XML Content-Type에 대해 요청 본문(\(type(of: body)))이 String이 아닙니다.")
-                }
-                urlRequest.httpBody = stringBody.data(using: .utf8)
-            case .octetStream: // 바이너리 데이터 직접 처리
-                guard let dataBody = body as? Data else {
-                    throw NetworkRequestError.invalidRequest(reason: "Octet Stream Content-Type에 대해 요청 본문(\(type(of: body)))이 Data가 아닙니다.")
-                }
-                urlRequest.httpBody = dataBody
-            case .multipart:
-                // 멀티파트는 이 함수를 호출하기 전에 buildURLRequest에서 별도로 처리됨
-                throw NetworkRequestError.invalidRequest(reason: "Multipart Content-Type은 'multipartData' 속성을 통해 처리되어야 합니다.")
-            }
-            
-            // Content-Type 헤더 설정 (요청별 헤더에 명시적으로 없거나, 현재 설정된 contentType과 다른 경우)
+    private func encodeAndSetRequestBody(_ urlRequest: inout URLRequest,
+                                         requestBody: RequestBody,
+                                         headers: inout HTTPHeaders) throws {
+        switch requestBody {
+        case .json(let boxed):
+            urlRequest.httpBody = try configuration.defaultEncoder.encode(boxed)
             if headers[HTTPHeaderField.contentType.rawValue] == nil {
-                headers[HTTPHeaderField.contentType.rawValue] = contentType.rawValue
-            } else if headers[HTTPHeaderField.contentType.rawValue] != contentType.rawValue && contentType != .multipart {
-                // 멀티파트가 아닌데 명시적 헤더와 추론된 contentType이 다르면 경고 또는 로직 수정 필요
-                // 여기서는 로깅만 하고, 요청자가 설정한 헤더를 우선시 할 수 있으나, 일관성을 위해 contentType.rawValue 사용
-                logger.log(message: "경고: 요청 헤더에 Content-Type ('\(headers[HTTPHeaderField.contentType.rawValue] ?? "")')이 명시되었으나, body 타입에 따른 Content-Type ('\(contentType.rawValue)')과 다를 수 있습니다. '\(contentType.rawValue)'를 사용합니다.", level: .info)
-                headers[HTTPHeaderField.contentType.rawValue] = contentType.rawValue
+                headers[HTTPHeaderField.contentType.rawValue] = HTTPContentType.json.rawValue
             }
-            
-            
-        } catch let error as NetworkRequestError {
-            throw error // 이미 NetifyError인 경우 다시 throw
-        } catch { // 기타 인코딩 관련 에러 (JSONEncoder.encode 등)
-            throw NetworkRequestError.encodingError(underlyingError: error)
+        case .urlEncoded(let params):
+            urlRequest.httpBody = params.toUrlEncodedQueryString()?.data(using: .utf8)
+            if headers[HTTPHeaderField.contentType.rawValue] == nil {
+                headers[HTTPHeaderField.contentType.rawValue] = HTTPContentType.urlEncoded.rawValue
+            }
+        case .text(let str):
+            urlRequest.httpBody = str.data(using: .utf8)
+            headers[HTTPHeaderField.contentType.rawValue] = HTTPContentType.plainText.rawValue
+        case .xml(let str):
+            urlRequest.httpBody = str.data(using: .utf8)
+            headers[HTTPHeaderField.contentType.rawValue] = HTTPContentType.xml.rawValue
+        case .data(let data, let type):
+            urlRequest.httpBody = data
+            headers[HTTPHeaderField.contentType.rawValue] = type.rawValue
         }
     }
-    
+
     /// 멀티파트 요청 본문을 구성합니다.
     private func buildMultipartBody(parts: [MultipartData], boundary: String) -> Data {
         let body = NSMutableData()
         for part in parts {
             body.append(part.buildHttpBodyPart(boundary: boundary)) // 각 파트 데이터 추가
         }
+
         body.appendString("--\(boundary)--\r\n") // 전체 본문의 끝을 알리는 최종 경계
         return body as Data
+    }
+
+    /// HTTPURLResponse → 소문자 키 헤더로 정규화
+    fileprivate func normalizedHeaders(_ http: HTTPURLResponse) -> HTTPHeaders {
+        http.allHeaderFields.reduce(into: [:]) { d, kv in
+            d[String(describing: kv.key).lowercased()] = String(describing: kv.value)
+        }
     }
     
     /// `AuthenticationProvider.authenticate`에서 발생할 수 있는 에러를 매핑합니다.
