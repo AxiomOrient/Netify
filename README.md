@@ -6,6 +6,93 @@
 
 Netify는 현대적인 Swift 애플리케이션을 위한 정교하고 유연한 네트워킹 솔루션입니다. Swift Concurrency(`async/await`)의 힘을 빌려, 개발자는 타입에 안전하면서도 효율적인 네트워크 통신 계층을 직관적으로 구축할 수 있습니다. 복잡성은 Netify에 맡기고, 핵심 가치 구현에 집중하십시오.
 
+## 변경 사항 요약 (브레이킹)
+
+- 로거 API 일원화: `logForOperation`, `logForDebug`, `logEnhancedError` 사용.
+- 민감정보 마스킹 강화: JWT, Bearer/Basic 변형, 쿼리 API 키, Cookie 등 정규식 커버리지 확대.
+- 플러그인 실패 컨텍스트 강화(B안 적용):
+  - `PluginFailureContext`가 더 이상 원본 `Error`와 원본 `URLRequest`를 노출하지 않습니다.
+  - 대신 `errorSummary: String`과 `requestSummary: RequestSummary?`(마스킹·요약본, Sendable)를 제공합니다.
+- Retry-After 정책: `maxRetryDelaySeconds` 상한으로 일관 적용(이미 구현되어 있어 추가 변경 없음).
+
+아래 마이그레이션 가이드를 통해 변경 대응 방법을 확인하세요.
+
+## 마이그레이션 가이드
+
+### 1) 로거 API 전환
+
+- 기존: `logger.log(message|request|response|error: ..., level:)`
+- 변경: 상황에 맞게 아래 메서드 사용
+  - `logForOperation(_:)`: 운영 이벤트용 간결 로그(마스킹 적용)
+  - `logForDebug(_:)`: 상세 디버그 로그(마스킹 적용, 필요 시 cURL 포함)
+  - `logEnhancedError(_:)`: `NetifyError`의 향상된 디버그 정보 출력
+
+예시 매핑:
+
+```swift
+// Old
+logger.log(message: "Initialized", level: .info)
+// New
+logger.logForOperation("Initialized")
+
+// Old
+logger.log(request: req, level: .debug)
+// New
+logger.logForDebug("➡️ Request: \(req.httpMethod ?? "?") \(req.url?.absoluteString ?? "?")\n    cURL: \(req.toCurlCommand())")
+
+// Old
+logger.log(response: resp, data: data, level: .debug)
+// New
+if let http = resp as? HTTPURLResponse {
+  logger.logForDebug("⬅️ Response: Status \(http.statusCode) from \(resp.url?.absoluteString ?? "?") (\(data.count) bytes)")
+}
+```
+
+### 2) PluginFailureContext 변경 (B안)
+
+- 기존
+
+```swift
+public struct PluginFailureContext: Sendable {
+  public let request: URLRequest?
+  public let error: Error
+  public let startedAt: Date
+  public let attemptCount: Int?
+  public let targetURL: String?
+}
+```
+
+- 변경
+
+```swift
+public struct RequestSummary: Sendable {
+  public let url: String?
+  public let method: String?
+  public let headers: [String: String]?
+  public let bodyPreview: String?
+}
+
+public struct PluginFailureContext: Sendable {
+  public let requestSummary: RequestSummary?
+  public let errorSummary: String
+  public let startedAt: Date
+  public let attemptCount: Int?
+  public let targetURL: String?
+}
+```
+
+- 마이그레이션 포인트
+  - `context.error` → `context.errorSummary`
+  - `context.request` → `context.requestSummary`
+  - 모든 값은 마스킹/요약본이므로 플러그인에서 안전하게 사용 가능합니다.
+
+### 3) 마스킹/보안 정책
+
+- Operation/Debug 로그 모두 민감정보 마스킹 적용
+  - JWT, Bearer/Basic 토큰류, token/password/secret 키워드, 쿼리 apiKey/key/access_token, Cookie 전체 마스킹
+- cURL 출력 시 민감 헤더는 `<masked>` 처리, 본문은 길이 제한 후 출력
+- 플러그인 실패 컨텍스트의 `RequestSummary`는 헤더 마스킹 + 본문 요약만 포함(스트림은 소비하지 않음)
+
 ## Netify가 제공하는 핵심 가치
 
   * **현대적 API 설계**: `async/await`를 중심으로 비동기 코드를 명료하고 우아하게 작성합니다.

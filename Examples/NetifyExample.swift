@@ -1,6 +1,5 @@
 import Foundation
 import Netify  // Netify 라이브러리를 임포트합니다.
-import OSLog   // 상세 오류 로깅을 위해 추가
 
 // MARK: - Models
 // API 응답을 디코딩하는 데 사용될 데이터 모델 정의
